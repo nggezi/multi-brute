@@ -1,0 +1,74 @@
+// Handler: Sub Store (模式 7)
+// GET 路径探测 — 检测 /api/utils/env 返回 status=success
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+	"sync/atomic"
+	"time"
+)
+
+func sendRequest(ctx context.Context, client *http.Client, fullURL string) bool {
+	req, err := http.NewRequestWithContext(ctx, "GET", fullURL, nil)
+	if err != nil {
+		return false
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusOK {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		if strings.Contains(string(bodyBytes), successFlag) {
+			return true
+		}
+	}
+	return false
+}
+
+func tryBothProtocols(ipPort string, path string, client *http.Client, file *os.File) bool {
+	cleanPath := strings.Trim(path, "/")
+	fullPath := cleanPath + "/api/utils/env"
+	httpProbeURL := fmt.Sprintf("http://%s/%s", ipPort, fullPath)
+	httpsProbeURL := fmt.Sprintf("https://%s/%s", ipPort, fullPath)
+
+	ctx1, cancel1 := context.WithTimeout(context.Background(), timeoutSeconds*time.Second)
+	defer cancel1()
+	if sendRequest(ctx1, client, httpProbeURL) {
+		output := fmt.Sprintf("http://%s?api=http://%s/%s", ipPort, ipPort, cleanPath)
+		writeResultToFile(file, output)
+		return true
+	}
+
+	ctx2, cancel2 := context.WithTimeout(context.Background(), timeoutSeconds*time.Second)
+	defer cancel2()
+	if sendRequest(ctx2, client, httpsProbeURL) {
+		output := fmt.Sprintf("https://%s?api=https://%s/%s", ipPort, ipPort, cleanPath)
+		writeResultToFile(file, output)
+		return true
+	}
+
+	return false
+}
+
+func processIP(ipPort string, file *os.File, paths []string, client *http.Client) {
+	defer wg.Done()
+	semaphore <- struct{}{}
+	defer func() { <-semaphore }()
+
+	for _, path := range paths {
+		if tryBothProtocols(ipPort, path, client, file) {
+			break
+		}
+	}
+	atomic.AddInt64(&completedCount, 1)
+}

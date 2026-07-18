@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Runtime output
+*.txt
+*.xlsx
+xui.go
+ipcx.py
+go.mod
+go.sum
+results.txt
+
+# Temp directories
+temp_parts/
+xui_outputs/
+temp_hmsuccess/
+temp_hmfail/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets
+.env
+*.token

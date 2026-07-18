@@ -1,0 +1,79 @@
+// Sub Store 路径探测 runner —— 模式 7
+// 通过探测 /api/utils/env 判断有效路径
+
+package main
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"os"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+	"runtime"
+	"net/http"
+)
+
+var wg sync.WaitGroup
+var semaphore = make(chan struct{}, {{.SemaphoreSize}})
+var completedCount int64
+var totalTasks int64
+var startTime time.Time
+
+const (
+	timeoutSeconds = 5
+	successFlag    = `{"status":"success","data"`
+)
+
+var headers = map[string]string{
+	"User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+	"Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+	"Accept-Encoding": "gzip, deflate, br",
+}
+
+{{.HandlerCode}}
+
+func main() {
+	inputFile := "{{.InputFile}}"
+	outputFile := "{{.OutputFile}}"
+	batchSize := {{.BatchSize}}
+	passwords := {{.PassList}}
+	paths := passwords
+
+	lines := loadList(inputFile)
+
+	file, err := os.OpenFile(outputFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "无法打开输出文件: %v\n", err)
+		return
+	}
+	defer file.Close()
+
+	totalTasks = int64(len(lines))
+	startTime = time.Now()
+	go updateProgress()
+
+	client := &http.Client{Timeout: timeoutSeconds * time.Second}
+
+	for i := 0; i < len(lines); i += batchSize {
+		end := i + batchSize
+		if end > len(lines) {
+			end = len(lines)
+		}
+		currentBatch := lines[i:end]
+
+		for _, ipPort := range currentBatch {
+			wg.Add(1)
+			go processIP(ipPort, file, paths, client)
+		}
+
+		wg.Wait()
+		time.Sleep(100 * time.Millisecond)
+		triggerGC()
+	}
+
+	time.Sleep(1 * time.Second)
+	fmt.Println("\n全部处理完成！")
+}

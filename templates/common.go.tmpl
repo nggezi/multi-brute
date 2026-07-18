@@ -1,0 +1,78 @@
+// 公共工具函数 —— 所有模式共享
+package main
+
+import (
+	"fmt"
+	"net/url"
+	"os"
+	"strings"
+	"sync/atomic"
+	"time"
+	"runtime"
+)
+
+// ── 归一化目标地址：URL → host:port ──
+//  "http://1.2.3.4:8443/login" → "1.2.3.4:8443"
+//  "1.2.3.4:443"              → "1.2.3.4:443"
+func normalizeTarget(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if strings.HasPrefix(raw, "http://") || strings.HasPrefix(raw, "https://") {
+		u, err := url.Parse(raw)
+		if err == nil && u.Host != "" {
+			return u.Host
+		}
+	}
+	return raw
+}
+
+// ── 从文件加载 IP 列表 ──
+func loadList(filename string) []string {
+	content, err := os.ReadFile(filename)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "无法读取 %s: %v\n", filename, err)
+		os.Exit(1)
+	}
+	lines := strings.Split(string(content), "\n")
+	var result []string
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			result = append(result, line)
+		}
+	}
+	return result
+}
+
+// ── 写结果到文件 ──
+func writeResultToFile(file *os.File, text string) {
+	file.WriteString(text + "\n")
+}
+
+// ── 进度条 ──
+func updateProgress() {
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		count := atomic.LoadInt64(&completedCount)
+		percent := float64(count) / float64(totalTasks) * 100
+		elapsed := int(time.Since(startTime).Seconds())
+
+		if count == 0 {
+			fmt.Printf("\r处理进度: %d/%d (%.2f%%)", count, totalTasks, percent)
+			continue
+		}
+		remaining := int(float64(elapsed)/float64(count)*(float64(totalTasks)-float64(count)))
+		fmt.Printf("\r处理进度: %d/%d (%.2f%%) 预计剩余: %d分%d秒",
+			count, totalTasks, percent, remaining/60, remaining%60)
+
+		if count >= totalTasks {
+			break
+		}
+	}
+}
+
+// ── GC 触发 ──
+func triggerGC() {
+	runtime.GC()
+}

