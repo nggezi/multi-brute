@@ -3,7 +3,7 @@ __pycache__/
 *.py[cod]
 *.pyo
 
-# 目标列表与本地字典（不公开真实目标）
+# 本地字典与目标（仓库内保留空占位文件；实际内容不跟踪）
 prefixes.txt
 username.txt
 password.txt
