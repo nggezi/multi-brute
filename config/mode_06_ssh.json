@@ -1,0 +1,18 @@
+{
+  "mode": 6,
+  "service": "SSH",
+  "description": "SSH 审查",
+  "default_ports": [22],
+  "user_input_required": true,
+  "default_ports_on_enter": true,
+  "fingerprint": {
+    "probes": [
+      {
+        "method": "TCP_BANNER",
+        "match_type": "prefix",
+        "match_value": "SSH-"
+      }
+    ]
+  },
+  "template_index": 5
+}

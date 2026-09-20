@@ -1,0 +1,21 @@
+{
+  "mode": 8,
+  "service": "OpenWrt",
+  "description": "OpenWrt/iStoreOS 审查",
+  "default_ports": [80, 8443],
+  "user_input_required": true,
+  "default_ports_on_enter": true,
+  "fingerprint": {
+    "probes": [
+      {
+        "method": "POST",
+        "path": "/cgi-bin/luci/",
+        "headers": {"Content-Type": "application/x-www-form-urlencoded"},
+        "body": "luci_username=test&luci_password=test",
+        "match_type": "title_contains",
+        "match_value": ["OpenWrt", "iStoreOS", "LuCI"]
+      }
+    ]
+  },
+  "template_index": 7
+}

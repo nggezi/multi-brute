@@ -1,0 +1,19 @@
+{
+  "mode": 15,
+  "service": "WebFP",
+  "description": "Web 指纹识别",
+  "default_ports": [80, 443, 8080, 8443, 3000, 5000, 8000, 8888, 9000],
+  "user_input_required": true,
+  "default_ports_on_enter": true,
+  "fingerprint": {
+    "probes": [
+      {
+        "method": "GET",
+        "path": "/",
+        "match_type": "title_keyword",
+        "match_value": "from_paths_file"
+      }
+    ]
+  },
+  "template_index": 14
+}

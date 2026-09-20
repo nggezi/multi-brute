@@ -1,0 +1,19 @@
+{
+  "mode": 12,
+  "service": "MiSub",
+  "description": "MiSub 指纹识别",
+  "default_ports": [25556],
+  "user_input_required": true,
+  "default_ports_on_enter": true,
+  "fingerprint": {
+    "probes": [
+      {
+        "method": "GET",
+        "path": "/",
+        "match_type": "title_contains",
+        "match_value": "MiSub"
+      }
+    ]
+  },
+  "template_index": 11
+}

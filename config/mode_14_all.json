@@ -1,0 +1,13 @@
+{
+  "mode": 14,
+  "service": "ALL",
+  "description": "全服务扫描（masscan + 指纹 + 自动路由）",
+  "default_ports": [],
+  "user_input_required": true,
+  "default_ports_on_enter": false,
+  "scan_all_ports": true,
+  "scan_all_services": true,
+  "fingerprint": {
+    "probes": []
+  }
+}

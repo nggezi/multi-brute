@@ -1,0 +1,27 @@
+{
+  "mode": 7,
+  "service": "Sub Store",
+  "description": "Sub Store 审查",
+  "default_ports": [3000, 3001],
+  "user_input_required": true,
+  "default_ports_on_enter": true,
+  "fingerprint": {
+    "probes": [
+      {
+        "port": 3000,
+        "method": "GET",
+        "path": "/{path}/api/utils/env",
+        "match_type": "json_contains",
+        "match_value": "\"status\":\"success\",\"data\""
+      },
+      {
+        "port": 3001,
+        "method": "GET",
+        "path": "/",
+        "match_type": "title_contains",
+        "match_value": "Sub Store"
+      }
+    ]
+  },
+  "template_index": 6
+}

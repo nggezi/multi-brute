@@ -1,0 +1,20 @@
+{
+  "mode": 10,
+  "service": "Alist",
+  "description": "Alist 审查",
+  "default_ports": [5244],
+  "user_input_required": true,
+  "default_ports_on_enter": true,
+  "fingerprint": {
+    "probes": [
+      {
+        "method": "GET",
+        "path": "/api/me",
+        "match_type": "json_field",
+        "match_field": "code",
+        "match_value": 200
+      }
+    ]
+  },
+  "template_index": 9
+}

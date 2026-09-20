@@ -1,0 +1,19 @@
+{
+  "mode": 1,
+  "service": "X-UI",
+  "description": "X-UI 面板审查",
+  "default_ports": [2053, 54321],
+  "user_input_required": true,
+  "default_ports_on_enter": true,
+  "fingerprint": {
+    "probes": [
+      {
+        "method": "GET",
+        "path": "/login",
+        "match_type": "body_contains",
+        "match_value": ["x-ui", "X-UI"]
+      }
+    ]
+  },
+  "template_index": 0
+}

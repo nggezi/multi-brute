@@ -1,0 +1,21 @@
+{
+  "mode": 4,
+  "service": "咸蛋",
+  "description": "咸蛋面板审查",
+  "default_ports": [],
+  "user_input_required": true,
+  "default_ports_on_enter": false,
+  "fingerprint": {
+    "probes": [
+      {
+        "method": "POST",
+        "path": "/login",
+        "headers": {"Content-Type": "application/json"},
+        "body": "{\"username\":\"test\",\"password\":\"test\"}",
+        "match_type": "json_contains",
+        "match_value": "data.token"
+      }
+    ]
+  },
+  "template_index": 3
+}

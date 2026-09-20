@@ -1,186 +1,137 @@
-# X-UI Brute
+# multi-brute
 
-基于 Go + Python 的混合爆破工具，支持 8 种面板/SSH 爆破，CIDR 网段展开，Telegram 通知。
+多服务面板 / 服务的**授权安全审查**工具。统一引擎（Go）+ 调度层（Python）架构，
+每个模式都自动执行完整流水线：
+
+```
+masscan 端口扫描 → 指纹验证 → 统一引擎审查 → 结果导出
+```
+
+> 仅限**自有资产**或**获得书面授权**的目标使用。使用者需自行确保合规。
+
+## 特性
+
+- **15 种服务模式 + 2 种聚合模式**：每种服务内置默认端口与指纹规则，自动筛选真实目标，避免无效请求。
+- **统一 Go 引擎**：所有模式共用一个编译后的引擎二进制，并发受控、写入加锁、支持断点续扫。
+- **指纹前置**：masscan 发现开放端口后，先用 HTTP/TCP 指纹确认真实服务，再进入审查阶段。
+- **韧性设计**：
+  - 指纹结果**分批落盘**（每 2000 个目标 fsync 一次），中途被杀不丢已扫结果；
+  - 审查阶段**每个服务完成即写** `results/`，不必等全部跑完；
+  - 支持**断点续扫**（以 `(IP, 端口)` 为粒度），重启后可选择继续或全新扫描；
+  - 中断（Ctrl+C / 异常）时自动把已完成的服务输出抢救到 `results/`。
+- **字典来源**：本地字典 / Kali 系统字典 (`/usr/share/wordlists`) / 内置默认凭证。
+- **多格式导出**：TXT / JSON / CSV。
 
 ## 目录结构
 
 ```
-x-ui/
-├── main.py                  # 唯一入口
-├── config.yaml              # 用户配置（改这里，保存即生效）
-├── .gitignore
-├── README.md
+.
+├── main.py                # 入口：切到项目根目录后执行 src/xui.py
+├── yj.sh                  # 快捷脚本（可选，先跑 bgp.py 再跑 main.py）
+├── guide.md
+├── config/                # 每个模式一份配置（端口 + 指纹规则）
+│   ├── mode_01_xui.json
+│   ├── ...
+│   ├── mode_15_webfp.json
+│   └── web_keywords.json  # 未知端口通用 Web 指纹关键词表
 ├── src/
-│   ├── config.py            # 读取 config.yaml + 环境变量
-│   ├── cli.py               # 命令行入口
-│   ├── models.py            # 面板模式数据模型
-│   ├── environment.py       # 环境检测 & 自动安装依赖
-│   ├── generators.py        # Go 代码生成
-│   ├── runner.py            # 分片 → 执行 → 合并
-│   ├── normalizer.py        # CIDR 展开 + URL 归一化
-│   ├── ip_query.py          # IP 地理查询 → Excel
-│   └── telegram.py          # Telegram 通知
-└── templates/               # Go 模板
-    ├── common.go.tmpl       # 公共函数（所有模式共享）
-    ├── runner_common.go.tmpl # 通用 runner（模式 1~5, 8）
-    ├── runner_ssh.go.tmpl   # SSH runner（模式 6）
-    ├── runner_substore.go.tmpl # Sub Store runner（模式 7）
-    └── handler_mode*.go.tmpl # 各模式差异 handler
+│   ├── xui.py             # 调度层：菜单、masscan、指纹、流水线、导出
+│   ├── engine.go          # 统一 Go 引擎
+│   ├── go.mod / go.sum
+│   └── bgp.py             # 按 ASN 拉取 IPv4 前缀（写入 prefixes.txt）
+├── results/               # 最终产物
+└── work/                  # 运行时中间目录（自动清理，不提交）
 ```
-
-## 快速开始
-
-### 1. 配置
-
-编辑 `config.yaml`，最少设两项：
-
-```yaml
-XUI_MODE: 1          # 1=XUI 2=哪吒 3=HUI 4=咸蛋 5=SUI 6=SSH 7=SubStore 8=OpenWrt
-XUI_INPUT_FILE: "ips.txt"
-XUI_THREADS: 500
-```
-
-### 2. 准备目标文件
-
-```
-# ips.txt — 支持多种格式混写
-192.168.1.1:443                # IP:Port
-10.0.0.1                       # 无端口自动补 :443
-10.0.0.0/30:8080               # CIDR 自动展开为 4 个
-172.16.0.0/24                  # /24 展开 256 个
-https://1.2.3.4:8443/login     # URL 格式，路径不丢
-# 注释行会被跳过
-```
-
-### 3. 运行
-
-```bash
-python main.py
-```
-
-## 三种使用方式
-
-### 方式一：config.yaml（推荐）
-
-```bash
-# 编辑 config.yaml 改好参数
-vim config.yaml
-
-# 直接跑，零交互
-python main.py
-```
-
-### 方式二：环境变量（临时覆盖）
-
-```bash
-# 覆盖 config.yaml 中的值，适合临时调整
-XUI_THREADS=1000 python main.py
-
-# 敏感信息不写 yaml，用环境变量
-TG_BOT_TOKEN=xxx TG_CHAT_ID=yyy python main.py
-```
-
-优先级：**环境变量 > config.yaml > 代码默认值**
-
-### 方式三：命令行参数（一次性）
-
-```bash
-python main.py -m 1 -i ips.txt -t 500 -b 2000
-
-# SSH 爆破 + 后门
-python main.py -m 6 -i ssh.txt --backdoor
-```
-
-| 参数 | 简写 | 说明 |
-|------|------|------|
-| `--mode 1~8` | `-m` | 爆破模式 |
-| `--input` | `-i` | 目标文件路径 |
-| `--threads` | `-t` | 并发协程数 |
-| `--batch` | `-b` | 每批数量 |
-| `--lines` | `-L` | 分片行数 |
-| `--sleep` | `-s` | 批次间冷却秒数 |
-| `--username-file` | `-U` | 用户名字典 |
-| `--password-file` | `-P` | 密码字典 |
-| `--backdoor` | | SSH 后门（仅模式6） |
-| `--no-excel` | | 跳过 Excel 生成 |
-
-## 爆破模式
-
-| -m | 名称 | 接口 | 默认凭据 |
-|----|------|------|----------|
-| 1 | XUI 面板 | POST /login (form) | admin / admin |
-| 2 | 哪吒面板 | POST /api/v1/login (json) | admin / admin |
-| 3 | HUI 面板 | POST /hui/auth/login | sysadmin / sysadmin |
-| 4 | 咸蛋面板 | POST /login (json) | admin / admin |
-| 5 | SUI 面板 | POST /app/api/login | admin / admin |
-| 6 | SSH | SSH 直连 + 蜜罐检测 + 后门 | root / password |
-| 7 | Sub Store | GET 路径探测 | 内置 key |
-| 8 | OpenWrt | POST /cgi-bin/luci/ | root / password |
-
-## 工作流程
-
-```
-config.yaml / 环境变量 / 命令行参数
-        │
-        ▼
-  环境检测（自动安装 curl/pip3/Go/依赖）
-        │
-        ▼
-  输入归一化（CIDR 展开 + URL 提取）
-        │
-        ▼
-  生成 Go 爆破代码 → 分片 → go run 并发爆破
-        │
-        ▼
-  合并结果 → IP 地理查询 → 生成 Excel
-        │
-        ▼
-  Telegram 通知 → 清理临时文件
-```
-
-## 输出产物
-
-```
-XUI-20260718-2230.txt      # IP:Port 用户名 密码
-XUI-20260718-2230.xlsx     # 含国家/城市/ISP 列
-```
-
-SSH 模式额外：
-```
-后门安装成功-20260718-2230.txt
-后门安装失败-20260718-2230.txt
-```
-
-## 配置参考
-
-详见 `config.yaml`，所有可配置项：
-
-| 变量 | 默认值 | 说明 |
-|------|--------|------|
-| `XUI_MODE` | 0 (交互) | 爆破模式 1~8 |
-| `XUI_INPUT_FILE` | 1.txt | 目标文件路径 |
-| `XUI_THREADS` | 250 | 并发协程数 |
-| `XUI_BATCH_SIZE` | 1000 | 每批处理数量 |
-| `XUI_LINES_PER_FILE` | 5000 | 分片行数 |
-| `XUI_SLEEP_SECONDS` | 2 | 批次间冷却 |
-| `XUI_USERNAME_FILE` | — | 自定义用户字典 |
-| `XUI_PASSWORD_FILE` | — | 自定义密码字典 |
-| `XUI_BACKDOOR` | false | SSH 后门开关 |
-| `XUI_BACKDOOR_CMD_FILE` | 后门命令.txt | 后门命令文件 |
-| `XUI_NO_EXCEL` | false | 跳过 Excel |
-| `TG_BOT_TOKEN` | — | Telegram Bot Token |
-| `TG_CHAT_ID` | — | Telegram Chat ID |
-| `GOPROXY` | 自动检测 | Go 代理地址 |
-| `GOSUMDB` | 自动检测 | Go 校验数据库 |
 
 ## 环境要求
 
-- Python 3.7+
-- Linux（Windows 跳过环境检测，需自行安装 Go）
-- SSH 模式额外需要 `golang.org/x/crypto/ssh`（自动安装）
+| 依赖 | 说明 |
+|------|------|
+| Python 3 | `requests`、`openpyxl` |
+| Go 1.21+ | 运行时会自动编译 `engine.go` |
+| masscan | 端口扫描，需手动安装：`sudo apt install masscan -y` |
 
-## 添加新面板
+`check_environment()` 会在启动时检测缺失项并按需安装（Go / pip / requests / openpyxl）。
 
-1. 在 `templates/` 下创建 `handler_mode9.go.tmpl`（写 `postRequest` + `processIP`）
-2. 在 `src/config.py` 的 `PANEL_MODES`、`DEFAULT_CREDENTIALS`、`OUTPUT_PREFIX` 各加一行
-3. 在 `src/cli.py` 的 `build_parser()` 里把 `choices=range(1, 9)` 改成 `range(1, 10)`
+## 使用
+
+```bash
+git clone https://github.com/nggezi/multi-brute.git
+cd multi-brute
+python3 main.py
+```
+
+按提示选择模式与目标输入方式。**所有模式默认走聚合流程。**
+
+### 目标输入格式
+
+`prefixes.txt`（每行一个，支持混合格式，`#` 开头为注释）：
+
+```
+192.168.1.1:443        # IP:端口（直通，不做 masscan）
+10.0.0.1               # 单 IP
+10.0.0.0/24            # CIDR（masscan 扫描默认端口）
+10.0.0.1-10.0.0.50     # 范围
+172.16.0.1 8080        # IP + 空格 + 端口
+```
+
+也可在运行时直接输入 IP 段，无需文件。
+
+### 模式列表
+
+| 模式 | 服务 | 默认端口 | 指纹 |
+|------|------|----------|------|
+| 1 | X-UI | 2053, 54321 | GET `/login` → 含 `x-ui` |
+| 2 | 哪吒 (Nezha) | 8008 | POST `/api/v1/login` → `success==true` |
+| 3 | H-UI | 8081 | POST `/hui/auth/login` → 含 `accessToken` |
+| 4 | 咸蛋 (xdpanel) | 需输入 | POST `/login` → `data.token` |
+| 5 | S-UI | 2095 | POST `/app/api/login` → `success==true` |
+| 6 | SSH | 22 | TCP banner `SSH-` |
+| 7 | Sub Store | 3000, 3001 | GET `/{path}/api/utils/env` 或 `/` |
+| 8 | OpenWrt / iStoreOS | 80, 8443 | POST `/cgi-bin/luci/` → title |
+| 9 | AI Key 池 | 需输入 | POST `/api/auth/login` → `success==true` |
+| 10 | Alist | 5244 | GET `/api/me` → `code==200` |
+| 11 | MiSub 登录 | 25556 | POST `/api/login` → `success==true` |
+| 12 | MiSub 指纹 | 25556 | GET `/` → title `MiSub` |
+| 13 | Socks5 / HTTP 代理 | 需指定 | TCP 连接 + 协议识别 |
+| 14 | **全服务扫描** | 全部（含 SSH） | 逐端口匹配全部服务指纹 |
+| 15 | 通用 Web 指纹海选 | 80, 443, 8080, 8443, 3000, 5000, 8000, 8888, 9000 | title 关键词 |
+| 16 | **全服务扫描（不含 SSH）** | 全部（去掉 22/80/443/8080/8443） | 同上（推荐） |
+
+### 字典来源
+
+1. **本地文件** — `username.txt` / `password.txt`（模式 7、9 固定用户名，只读 `password.txt`）
+2. **Kali 系统字典** — `/usr/share/wordlists`
+3. **默认凭证** — 内置各服务的常见弱口令组合
+
+## 输出
+
+最终结果写入 `results/{服务名}-{YYYYMMDD-HHMMSS}.txt`，可选 JSON / CSV。
+
+中断时已完成但未汇总的输出会抢救为 `results/{服务名}-rescue-{时间戳}-p{pid}.txt`。
+
+运行时中间文件全部在 `work/`，正常结束会自动清空。
+
+## 断点续扫
+
+指纹阶段以 `(IP, 端口)` 为粒度记录进度。若上次运行被中断，进度会保留；
+下次启动时会询问：
+
+```
+发现上次未完成的指纹进度，是否续扫？(Y/n)：
+```
+
+- 回车 / `Y` → 只处理剩余目标
+- `n` → 清空旧进度，全新扫描
+
+## 开发
+
+```bash
+python -m py_compile src/xui.py     # 语法检查
+go vet ./src/...                    # 引擎检查（可选）
+```
+
+## 免责声明
+
+本项目仅供安全研究与**授权范围内**的资产审查使用。请勿用于未授权目标。
+因使用本工具产生的一切后果由使用者自行承担。

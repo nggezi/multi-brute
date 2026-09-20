@@ -3,20 +3,18 @@ __pycache__/
 *.py[cod]
 *.pyo
 
-# Runtime output
-*.txt
-*.xlsx
-xui.go
-ipcx.py
-go.mod
-go.sum
-results.txt
+# 目标列表与本地字典（不公开真实目标）
+prefixes.txt
+username.txt
+password.txt
 
-# Temp directories
-temp_parts/
-xui_outputs/
-temp_hmsuccess/
-temp_hmfail/
+# 运行时产物
+results/
+work/
+*.xlsx
+telegram_config.txt
+*.token
+.env
 
 # IDE
 .idea/
@@ -27,7 +25,3 @@ temp_hmfail/
 # OS
 .DS_Store
 Thumbs.db
-
-# Secrets
-.env
-*.token

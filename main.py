@@ -1,18 +1,10 @@
 #!/usr/bin/env python3
-"""X-UI 混合爆破工具 —— 入口文件.
-
-直接运行:  python main.py
-交互式运行:  python main.py
-环境变量运行:  XUI_MODE=1 XUI_INPUT_FILE=ips.txt python main.py
-"""
-
-import sys
+# -*- coding: utf-8 -*-
+"""项目入口：切换到项目根目录后执行 src/xui.py。"""
 import os
+import runpy
 
-# 确保项目根在 path 中
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.dirname(os.path.abspath(__file__))
+os.chdir(ROOT)
 
-from src.cli import main
-
-if __name__ == "__main__":
-    main()
+runpy.run_path(os.path.join(ROOT, "src", "xui.py"), run_name="__main__")

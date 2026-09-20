@@ -1,0 +1,18 @@
+{
+  "mode": 13,
+  "service": "Proxy",
+  "description": "Socks5/HTTP 代理审查",
+  "default_ports": [],
+  "user_input_required": true,
+  "default_ports_on_enter": false,
+  "fingerprint": {
+    "probes": [
+      {
+        "method": "TCP_CONNECT",
+        "match_type": "protocol_detection",
+        "match_value": ["socks5", "http_connect"]
+      }
+    ]
+  },
+  "template_index": 12
+}

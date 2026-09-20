@@ -1,0 +1,22 @@
+{
+  "mode": 9,
+  "service": "AI Key",
+  "description": "AI Key 池审查",
+  "default_ports": [],
+  "user_input_required": true,
+  "default_ports_on_enter": false,
+  "fingerprint": {
+    "probes": [
+      {
+        "method": "POST",
+        "path": "/api/auth/login",
+        "headers": {"Content-Type": "application/json"},
+        "body": "{\"username\":\"test\",\"password\":\"test\"}",
+        "match_type": "json_field",
+        "match_field": "success",
+        "match_value": true
+      }
+    ]
+  },
+  "template_index": 8
+}
