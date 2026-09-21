@@ -1,0 +1,12 @@
+{
+  "fingerprint_timeout": 1.5,
+  "fingerprint_retry_timeout": 3.0,
+  "fingerprint_workers": 32,
+  "fingerprint_batch_size": 2000,
+  "engine_workers": 50,
+  "mode_workers": 4,
+  "masscan_rate": 10000,
+  "masscan_wait": 3,
+  "masscan_timeout": 600,
+  "http_timeout": 2
+}

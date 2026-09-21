@@ -46,6 +46,8 @@ type ModeConfig struct {
 	Fingerprint          FingerprintConfig  `json:"fingerprint"`
 	ScanAllPorts         bool               `json:"scan_all_ports,omitempty"`
 	ScanAllServices      bool               `json:"scan_all_services,omitempty"`
+	EngineWorkers        int                `json:"engine_workers,omitempty"`
+	HTTPTimeout          int                `json:"http_timeout,omitempty"`
 }
 
 // ==================== Globals ====================
@@ -82,11 +84,10 @@ func applyRateLimit() {
 
 // ==================== Utilities ====================
 
-func loadList(filename string) []string {
+func loadList(filename string) ([]string, error) {
 	content, err := os.ReadFile(filename)
 	if err != nil {
-		fmt.Println("无法读取", filename, ":", err)
-		os.Exit(1)
+		return nil, err
 	}
 	lines := strings.Split(string(content), "\n")
 	var result []string
@@ -96,27 +97,38 @@ func loadList(filename string) []string {
 			result = append(result, line)
 		}
 	}
-	return result
+	return result, nil
 }
 
-func loadConfig(filename string) ModeConfig {
+func loadConfig(filename string) (ModeConfig, error) {
+	var config ModeConfig
 	data, err := os.ReadFile(filename)
 	if err != nil {
-		fmt.Println("无法读取配置文件:", err)
-		os.Exit(1)
+		return config, err
 	}
-	var config ModeConfig
 	if err := json.Unmarshal(data, &config); err != nil {
-		fmt.Println("配置文件解析失败:", err)
-		os.Exit(1)
+		return config, err
 	}
-	return config
+	return config, nil
 }
 
 func writeResultToFile(file *os.File, text string) {
 	fileMu.Lock()
 	defer fileMu.Unlock()
 	file.WriteString(text)
+}
+
+// safeRun 包裹 worker，捕获 panic 避免单个异常目标导致整个进程崩溃。
+// 注意：process* 函数内部以 defer 形式释放信号量与 wg.Done()，
+// 这些 defer 在 panic 展开时同样会执行，因此这里只做 recover + 日志，
+// 不再重复释放，否则会导致 WaitGroup 计数为负/重复 Done。
+func safeRun(fn func(string, *os.File, []string, []string, ModeConfig), ipPort string, file *os.File, usernames, passwords []string, config ModeConfig) {
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Printf("\n[警告] 处理 %s 时发生异常: %v\n", ipPort, r)
+		}
+	}()
+	fn(ipPort, file, usernames, passwords, config)
 }
 
 // ==================== HTTP Brute Force ====================
@@ -329,8 +341,10 @@ func matchSuccess(config ModeConfig, data map[string]interface{}, statusCode int
 		case []interface{}:
 			lowerTitle := strings.ToLower(title)
 			for _, item := range v {
-				if strings.Contains(lowerTitle, strings.ToLower(item.(string))) {
-					return true
+				if s, ok := item.(string); ok {
+					if strings.Contains(lowerTitle, strings.ToLower(s)) {
+						return true
+					}
 				}
 			}
 		}
@@ -388,47 +402,92 @@ func processHTTP(ipPort string, file *os.File, usernames, passwords []string, co
 	}
 	probe := config.Fingerprint.Probes[0]
 
+	reqTimeout := time.Duration(config.HTTPTimeout) * time.Second
+	if reqTimeout <= 0 {
+		reqTimeout = 2 * time.Second
+	}
+
+	// 先探测该端口使用 http 还是 https，避免每个凭据都试两种协议
+	scheme := detectScheme(ip, port, probe.Path, reqTimeout)
+
 	for _, username := range usernames {
 		for _, password := range passwords {
-			// Try HTTP then HTTPS
-			for _, scheme := range []string{"http", "https"} {
-				url := fmt.Sprintf("%s://%s:%s%s", scheme, ip, port, probe.Path)
-				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			url := fmt.Sprintf("%s://%s:%s%s", scheme, ip, port, probe.Path)
+			ctx, cancel := context.WithTimeout(context.Background(), reqTimeout)
 
-				var data map[string]interface{}
-				var statusCode int
-				var title string
-				var err error
+			var data map[string]interface{}
+			var statusCode int
+			var title string
+			var err error
 
-				switch probe.Method {
-				case "POST":
-					if probe.Body != "" {
-						body := strings.ReplaceAll(probe.Body, "test", password)
-						body = strings.ReplaceAll(body, "\"username\":\"test\"", fmt.Sprintf("\"username\":\"%s\"", username))
-						body = strings.ReplaceAll(body, "\"password\":\"test\"", fmt.Sprintf("\"password\":\"%s\"", password))
-						data, statusCode, err = tryHTTPPostJSON(ctx, url, body, probe.Headers)
-					} else {
-						data, statusCode, err = tryHTTPPostForm(ctx, url, username, password, probe.Headers)
-					}
-				case "GET":
-					title, data, statusCode, err = tryHTTPGet(ctx, url)
+			switch probe.Method {
+			case "POST":
+				if probe.Body != "" {
+					body := strings.ReplaceAll(probe.Body, "test", password)
+					body = strings.ReplaceAll(body, "\"username\":\"test\"", fmt.Sprintf("\"username\":\"%s\"", username))
+					body = strings.ReplaceAll(body, "\"password\":\"test\"", fmt.Sprintf("\"password\":\"%s\"", password))
+					data, statusCode, err = tryHTTPPostJSON(ctx, url, body, probe.Headers)
+				} else {
+					data, statusCode, err = tryHTTPPostForm(ctx, url, username, password, probe.Headers)
 				}
-				cancel()
+			case "GET":
+				title, data, statusCode, err = tryHTTPGet(ctx, url)
+			}
+			cancel()
 
-				if err != nil {
-					continue
-				}
+			if err != nil {
+				continue
+			}
 
-				if matchSuccess(config, data, statusCode, title) {
-					cred := fmt.Sprintf("%s:%s %s %s\n", ip, port, username, password)
-					writeResultToFile(file, cred)
-					atomic.AddInt64(&completedCount, 1)
-					return
-				}
+			if matchSuccess(config, data, statusCode, title) {
+				cred := fmt.Sprintf("%s:%s %s %s\n", ip, port, username, password)
+				writeResultToFile(file, cred)
+				atomic.AddInt64(&completedCount, 1)
+				return
 			}
 		}
 	}
 	atomic.AddInt64(&completedCount, 1)
+}
+
+// detectScheme 检测目标端口应使用 http 还是 https。
+// 443/8443 直接判定为 https；其余先试 http，失败再试 https，都失败则回退 http。
+func detectScheme(ip, port, path string, timeout time.Duration) string {
+	if port == "443" || port == "8443" {
+		return "https"
+	}
+	// 快速试探 http
+	if probeReachable("http", ip, port, path, timeout) {
+		return "http"
+	}
+	if probeReachable("https", ip, port, path, timeout) {
+		return "https"
+	}
+	return "http"
+}
+
+func probeReachable(scheme, ip, port, path string, timeout time.Duration) bool {
+	if timeout <= 0 {
+		timeout = 3 * time.Second
+	}
+	url := fmt.Sprintf("%s://%s:%s%s", scheme, ip, port, path)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return false
+	}
+	client := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return false
+	}
+	resp.Body.Close()
+	return true
 }
 
 func processSSH(ipPort string, file *os.File, usernames, passwords []string, config ModeConfig) {
@@ -525,7 +584,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	config := loadConfig(os.Args[1])
+	config, err := loadConfig(os.Args[1])
+	if err != nil {
+		fmt.Println("无法加载配置文件:", err)
+		os.Exit(1)
+	}
 	inputFile := os.Args[2]
 
 	// Rate limiting defaults
@@ -549,9 +612,21 @@ func main() {
 		}
 	}
 
-	// Read wordlists
-	usernames := loadList("user.txt")
-	passwords := loadList("pass.txt")
+	// Read wordlists（缺失时优雅报错，不直接崩溃）
+	usernames, err := loadList("user.txt")
+	if err != nil {
+		fmt.Println("无法读取 user.txt:", err)
+		return
+	}
+	passwords, err := loadList("pass.txt")
+	if err != nil {
+		fmt.Println("无法读取 pass.txt:", err)
+		return
+	}
+	if len(usernames) == 0 || len(passwords) == 0 {
+		fmt.Println("字典为空（user.txt / pass.txt），无需处理")
+		return
+	}
 
 	// Output file
 	modeNames := map[int]string{
@@ -567,7 +642,11 @@ func main() {
 	}
 	defer outputFile.Close()
 
-	semaphore = make(chan struct{}, 50)
+	workers := config.EngineWorkers
+	if workers <= 0 {
+		workers = 50
+	}
+	semaphore = make(chan struct{}, workers)
 	totalTasks = int64(len(batch))
 	startTime = time.Now()
 
@@ -582,11 +661,11 @@ func main() {
 		wg.Add(1)
 		switch config.Mode {
 		case 6:
-			go processSSH(ipPort, outputFile, usernames, passwords, config)
+			go safeRun(processSSH, ipPort, outputFile, usernames, passwords, config)
 		case 13:
-			go processTCP(ipPort, outputFile, usernames, passwords, config)
+			go safeRun(processTCP, ipPort, outputFile, usernames, passwords, config)
 		default:
-			go processHTTP(ipPort, outputFile, usernames, passwords, config)
+			go safeRun(processHTTP, ipPort, outputFile, usernames, passwords, config)
 		}
 	}
 	wg.Wait()

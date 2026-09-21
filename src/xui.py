@@ -5,6 +5,7 @@ import time
 import shutil
 import sys
 import re
+import json
 try:
     import readline
 except ImportError:
@@ -33,6 +34,39 @@ MASSCAN_RESULTS  = os.path.join(WORK_DIR, "masscan_results.txt")
 MASSCAN_RAW      = os.path.join(WORK_LOG_DIR, "masscan_raw.txt")
 FINGERPRINT_HITS = os.path.join(WORK_DIR, "fingerprint_hits.txt")   # 指纹命中增量落盘
 FINGERPRINT_DONE = os.path.join(WORK_DIR, "fingerprint_done.txt")   # 已探测 IP 记录（续跑用）
+FINGERPRINT_RETRY = os.path.join(WORK_DIR, "fingerprint_retry.txt") # 探测失败待重试 (ip\tport)
+SETTINGS_FILE = os.path.join("config", "settings.json")
+
+# ---------- 可调参数（可由 config/settings.json 覆盖） ----------
+_DEFAULT_SETTINGS = {
+    "fingerprint_timeout": 1.5,       # 指纹探测单次超时（秒）
+    "fingerprint_retry_timeout": 3.0,  # 重试轮的超时（秒）
+    "fingerprint_workers": 32,        # 指纹并发
+    "fingerprint_batch_size": 2000,   # 指纹分批提交大小
+    "engine_workers": 50,             # 引擎并发（Go 端）
+    "mode_workers": 4,                # 审查阶段同时跑几种服务
+    "masscan_rate": 10000,            # masscan 发包速率
+    "masscan_wait": 3,                # masscan --wait
+    "masscan_timeout": 600,           # masscan 进程超时（秒）
+    "http_timeout": 2,                # 引擎 HTTP 请求超时（秒）
+}
+
+
+def load_settings():
+    """加载 config/settings.json，缺失项用默认值补齐"""
+    cfg = dict(_DEFAULT_SETTINGS)
+    try:
+        if os.path.exists(SETTINGS_FILE):
+            with open(SETTINGS_FILE, 'r', encoding='utf-8') as f:
+                user_cfg = json.load(f)
+            if isinstance(user_cfg, dict):
+                cfg.update({k: v for k, v in user_cfg.items() if k in _DEFAULT_SETTINGS})
+    except Exception:
+        pass
+    return cfg
+
+
+SETTINGS = load_settings()
 
 
 # =========================== 终端输出 UI 层（精简版） ===========================
@@ -154,18 +188,23 @@ def ui_progress(done, total, prefix="进度"):
 
 # =========================== Masscan 封装 ===========================
 
-def run_masscan(ip_range, ports, rate=10000, output_file=MASSCAN_RESULTS):
+def run_masscan(ip_range, ports, rate=None, output_file=MASSCAN_RESULTS):
     """
     调用 masscan 扫描 IP 范围的开放端口
     :param ip_range: IP 范围，如 "192.168.1.0/24" 或 "10.0.0.1-10.0.0.254"
     :param ports: 端口列表，如 [80, 443, 8080]
-    :param rate: 发包速率
+    :param rate: 发包速率（默认取 settings.masscan_rate）
     :param output_file: 输出文件
     :return: 扫描结果列表，格式为 [(ip, port), ...]
     """
     if shutil.which("masscan") is None:
         ui_warn("masscan 未安装，跳过端口扫描")
         return []
+
+    if rate is None:
+        rate = SETTINGS.get("masscan_rate", 10000)
+    wait_s = str(SETTINGS.get("masscan_wait", 3))
+    timeout_s = SETTINGS.get("masscan_timeout", 600)
 
     ports_str = ",".join(map(str, ports))
     tmp_output = MASSCAN_RAW
@@ -175,15 +214,15 @@ def run_masscan(ip_range, ports, rate=10000, output_file=MASSCAN_RESULTS):
         "-p", ports_str,
         "--rate", str(rate),
         "-oL", tmp_output,
-        "--wait", "3"
+        "--wait", wait_s
     ]
 
     ui_info(f"masscan {ip_range} · {len(ports)} 个端口 · 速率 {rate}/s")
     try:
-        subprocess.run(cmd, check=True, timeout=600,
+        subprocess.run(cmd, check=True, timeout=timeout_s,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except subprocess.TimeoutExpired:
-        ui_warn("masscan 扫描超时（10分钟），继续处理已有结果")
+        ui_warn(f"masscan 扫描超时（{timeout_s // 60}分钟），继续处理已有结果")
     except subprocess.CalledProcessError as e:
         ui_err(f"masscan 执行失败: {e}")
         return []
@@ -229,7 +268,7 @@ def fingerprint_probe(url, probe_config, timeout=3):
     对单个目标执行指纹探测
     :param url: 目标 URL
     :param probe_config: 探测配置
-    :return: bool 是否匹配
+    :return: True=匹配；False=成功响应但不匹配；None=探测失败(超时/连接错误)，可重试
     """
     method = probe_config.get("method", "GET")
     path = probe_config.get("path", "/")
@@ -249,9 +288,9 @@ def fingerprint_probe(url, probe_config, timeout=3):
             req = urllib.request.Request(full_url)
             for k, v in headers.items():
                 req.add_header(k, v)
-            resp = urllib.request.urlopen(req, timeout=timeout, context=ctx)
-            content = resp.read().decode('utf-8', errors='ignore')
-            status_code = resp.getcode()
+            with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+                content = resp.read().decode('utf-8', errors='ignore')
+                status_code = resp.getcode()
 
         elif method == "POST":
             data = body.encode('utf-8') if body else None
@@ -259,9 +298,9 @@ def fingerprint_probe(url, probe_config, timeout=3):
             req.add_header("Content-Type", "application/json")
             for k, v in headers.items():
                 req.add_header(k, v)
-            resp = urllib.request.urlopen(req, timeout=timeout, context=ctx)
-            content = resp.read().decode('utf-8', errors='ignore')
-            status_code = resp.getcode()
+            with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+                content = resp.read().decode('utf-8', errors='ignore')
+                status_code = resp.getcode()
 
         elif method == "TCP_BANNER":
             # TCP 连接检测
@@ -271,46 +310,59 @@ def fingerprint_probe(url, probe_config, timeout=3):
             port = parsed.port or 80
             import socket
             sock = socket.create_connection((host, port), timeout=timeout)
-            banner = sock.recv(1024).decode('utf-8', errors='ignore')
-            sock.close()
+            try:
+                banner = sock.recv(1024).decode('utf-8', errors='ignore')
+            finally:
+                sock.close()
             prefix = match_value if isinstance(match_value, str) else ""
             return banner.startswith(prefix)
 
         else:
             return False
 
+    except urllib.error.HTTPError as e:
+        # 服务端有响应（如 401/403/404）：属于「确认存在服务」，不是可重试失败
+        try:
+            content = e.read().decode('utf-8', errors='ignore')
+            status_code = e.code
+        except Exception:
+            return False
+    except (urllib.error.URLError, TimeoutError, OSError):
+        # 超时 / 连接失败：可重试
+        return None
     except Exception:
-        return False
+        return None
 
     # 匹配逻辑
     if match_type == "json_field":
         try:
-            import json
             data = json.loads(content)
             field_val = data.get(probe_config.get("match_field", ""))
             if isinstance(field_val, bool):
                 return field_val == match_value
             elif isinstance(field_val, (int, float)):
                 return field_val == match_value
-        except:
+        except Exception:
             return False
 
     elif match_type == "json_contains":
-        return match_value in content
+        if isinstance(match_value, list):
+            return any(str(v) in content for v in match_value)
+        return str(match_value) in content
 
     elif match_type == "body_contains":
         lower_content = content.lower()
         if isinstance(match_value, list):
-            return any(v.lower() in lower_content for v in match_value)
-        return match_value.lower() in lower_content
+            return any(str(v).lower() in lower_content for v in match_value)
+        return str(match_value).lower() in lower_content
 
     elif match_type == "title_contains":
         title_match = re.search(r'<title[^>]*>(.*?)</title>', content, re.IGNORECASE | re.DOTALL)
         if title_match:
             title = title_match.group(1).strip()
             if isinstance(match_value, list):
-                return any(v.lower() in title.lower() for v in match_value)
-            return match_value.lower() in title.lower()
+                return any(str(v).lower() in title.lower() for v in match_value)
+            return str(match_value).lower() in title.lower()
         return False
 
     elif match_type == "title_keyword":
@@ -319,12 +371,12 @@ def fingerprint_probe(url, probe_config, timeout=3):
             return False
         title = title_match.group(1).strip().lower()
         if isinstance(match_value, list):
-            return any(v.lower() in title for v in match_value)
+            return any(str(v).lower() in title for v in match_value)
         return str(match_value).lower() in title
 
     elif match_type == "protocol_detection":
         if isinstance(match_value, list):
-            return any(v.lower() in content.lower() for v in match_value)
+            return any(str(v).lower() in content.lower() for v in match_value)
         return str(match_value).lower() in content.lower()
 
     elif match_type == "http_ok":
@@ -333,13 +385,16 @@ def fingerprint_probe(url, probe_config, timeout=3):
     return False
 
 
-def fingerprint_scan(target, mode_config):
+def fingerprint_scan(target, mode_config, timeout=None):
     """
     对目标执行指纹扫描，判断是否属于该模式对应的服务
     :param target: "ip:port" 或 "ip"
     :param mode_config: 模式配置
-    :return: bool
+    :return: True=匹配；False=确认不匹配；None=探测失败(可重试)
     """
+    if timeout is None:
+        timeout = SETTINGS.get("fingerprint_timeout", 1.5)
+
     probes = mode_config.get("fingerprint", {}).get("probes", [])
     if not probes:
         return True  # 无指纹规则时默认匹配
@@ -352,6 +407,7 @@ def fingerprint_scan(target, mode_config):
         else:
             target = f"http://{target}"
 
+    any_failed = False
     for probe in probes:
         probe_port = probe.get("port")
         if probe_port:
@@ -361,22 +417,30 @@ def fingerprint_scan(target, mode_config):
                 if str(probe_port) != target_port:
                     continue
 
-        if fingerprint_probe(target, probe):
+        res = fingerprint_probe(target, probe, timeout=timeout)
+        if res is True:
             return True
+        if res is None:
+            any_failed = True
 
+    # 所有 probe 都跑完：若有失败（超时/连接错误）则返回 None 以便重试
+    if any_failed:
+        return None
     return False
 
 
 def _fingerprint_check_one(item, mode_config):
-    """单目标指纹验证（线程池工作单元）"""
+    """单目标指纹验证（线程池工作单元）
+    :return: (ip, port, result)  result: True=匹配 / False=不匹配 / None=失败可重试
+    """
     ip, port = item
     try:
-        return (ip, port, bool(fingerprint_scan(f"{ip}:{port}", mode_config)))
+        return (ip, port, fingerprint_scan(f"{ip}:{port}", mode_config))
     except Exception:
-        return (ip, port, False)
+        return (ip, port, None)
 
 
-def fingerprint_web_title(ip, port, keywords, timeout=3):
+def fingerprint_web_title(ip, port, keywords, timeout=None):
     """通用 Web 指纹：抓取 <title> 并与关键词表比对
     :param ip: 目标 IP
     :param port: 目标端口
@@ -385,6 +449,8 @@ def fingerprint_web_title(ip, port, keywords, timeout=3):
     """
     if not keywords:
         return None
+    if timeout is None:
+        timeout = SETTINGS.get("fingerprint_timeout", 1.5)
     scheme = "https" if int(port) in (443, 8443) else "http"
     url = f"{scheme}://{ip}:{port}/"
 
@@ -446,19 +512,21 @@ def filter_unknown_ports_by_title(results, keywords, max_workers=12, exclude_mod
     return matched
 
 
-def filter_by_fingerprint(results, mode_config, max_workers=12):
+def filter_by_fingerprint(results, mode_config, max_workers=None):
     """
     对 masscan 结果进行指纹过滤（并发）
     :param results: [(ip, port), ...]
     :param mode_config: 模式配置
-    :param max_workers: 并发线程数
-    :return: 过滤后的结果
+    :param max_workers: 并发线程数（默认取 settings.fingerprint_workers）
+    :return: 过滤后的结果（仅 True 判定；None=探测失败不计入，交由上层重试/忽略）
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     total = len(results)
     if total == 0:
         return []
+    if max_workers is None:
+        max_workers = SETTINGS.get("fingerprint_workers", 32)
 
     filtered = []
     workers = min(max_workers, total)
@@ -467,7 +535,7 @@ def filter_by_fingerprint(results, mode_config, max_workers=12):
                    for item in results]
         for future in as_completed(futures):
             ip, port, ok = future.result()
-            if ok:
+            if ok is True:
                 filtered.append((ip, port))
 
     return filtered
@@ -892,7 +960,11 @@ def get_ports_for_mode(config, user_input):
 
 
 def prepare_unified_engine(config, ip_file, usernames, passwords, ports, output_file):
-    """为统一引擎准备运行环境（所有文件写入 WORK_DIR）"""
+    """为统一引擎准备运行环境（所有文件写入 WORK_DIR）
+
+    注：当前单模式与聚合模式均改用 execute_one_mode（Popen 实时 tail），
+    本函数保留供需要预生成 ENGINE_CONF 的场景调用。
+    """
     # 写入 IP 列表
     shutil.copy(ip_file, ENGINE_INPUT)
 
@@ -905,52 +977,15 @@ def prepare_unified_engine(config, ip_file, usernames, passwords, ports, output_
     # 写入端口列表到配置（覆盖默认端口）
     config["active_ports"] = ports
 
+    # 注入可调参数（供引擎使用）
+    config["engine_workers"] = SETTINGS.get("engine_workers", 50)
+    config["http_timeout"] = SETTINGS.get("http_timeout", 2)
+
     # 写入配置 JSON
     with open(ENGINE_CONF, 'w', encoding='utf-8') as f:
         _json.dump(config, f, ensure_ascii=False, indent=2)
 
     return ENGINE_CONF
-
-
-def run_unified_engine(config_path, input_file):
-    """运行统一 Go 引擎"""
-    go_exec = shutil.which("go")
-    if not go_exec:
-        go_exec = "/usr/local/go/bin/go"
-    if not os.path.exists(go_exec):
-        ui_err("Go 未安装，请先安装 Go")
-        sys.exit(1)
-
-    # 确保 go.mod 存在（位于 src/）
-    if not os.path.exists(os.path.join(SRC_DIR, "go.mod")):
-        subprocess.run([go_exec, "mod", "init", "scan-engine"], check=True, cwd=SRC_DIR)
-    subprocess.run([go_exec, "mod", "tidy"], check=True, cwd=SRC_DIR)
-
-    # 引擎在 WORK_DIR 中运行，输出文件也落在 WORK_DIR
-    conf_abs = os.path.abspath(config_path)
-    in_abs = os.path.abspath(input_file)
-    engine_bin = build_engine(go_exec)
-    try:
-        result = subprocess.run([engine_bin, conf_abs, in_abs], cwd=WORK_DIR,
-                                capture_output=True, text=True)
-    except Exception as e:
-        ui_err(f"无法启动 Go 引擎: {e}")
-        sys.exit(1)
-    if result.returncode != 0:
-        ui_err(f"Go 引擎运行失败（退出码 {result.returncode}）")
-        if result.stderr:
-            ui_print("---- 引擎错误输出 ----")
-            ui_print(result.stderr.strip())
-            ui_print("----------------------")
-        else:
-            ui_warn("引擎未输出错误信息，请检查配置文件与输入文件。")
-        sys.exit(1)
-    # 引擎的 \r 逐条进度在 IP 段下会刷屏，仅保留最后的完成行
-    if result.stdout:
-        tail = [ln.strip() for ln in result.stdout.replace("\r", "\n").split("\n") if ln.strip()]
-        if tail:
-            ui_info(tail[-1])
-    return result
 
 
 _ENGINE_BUILD_LOCK = threading.Lock()
@@ -1441,31 +1476,39 @@ def run_pipeline(mode):
             "ports": ports,
         })
 
-    # 5. 运行统一引擎
+    # 5. 运行统一引擎（Popen 实时 tail：命中即时打印 + 实时写 results/）
     ui_stage("统一引擎审查")
-    config = load_mode_config(mode)
-    config_path = prepare_unified_engine(config, input_file, usernames, passwords, ports, ENGINE_INPUT)
-    run_unified_engine(config_path, ENGINE_INPUT)
+    beijing_time = datetime.now(timezone.utc) + timedelta(hours=8)
+    time_str = beijing_time.strftime("%Y%m%d-%H%M%S")
+    final_result_file = os.path.join(RESULT_DIR, f"{display_name}-{time_str}.txt")
+
+    # 从输入文件读回 (ip, port) 供引擎执行
+    engine_targets = []
+    with open(input_file, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if not line or ":" not in line:
+                continue
+            _ip, _port = line.rsplit(":", 1)
+            try:
+                engine_targets.append((_ip, int(_port)))
+            except ValueError:
+                continue
+
+    _, hit_count = execute_one_mode(mode, engine_targets, final_result_file,
+                                    time_str, usernames, passwords)
 
     # 清理进度文件
     if os.path.exists(progress_file):
         os.remove(progress_file)
 
-    # 6. 整理结果（引擎输出在 WORK_DIR 下）
-    output_name = os.path.join(WORK_DIR, MODE_NAMES.get(mode, "output") + ".txt")
-    beijing_time = datetime.now(timezone.utc) + timedelta(hours=8)
-    time_str = beijing_time.strftime("%Y%m%d-%H%M%S")
-
-    final_result_file = None
-    hit_count = 0
-    if os.path.exists(output_name):
-        # 结果去重
-        with open(output_name, 'r', encoding='utf-8') as f:
+    # 6. 整理结果（execute_one_mode 已实时写入 results/）
+    if hit_count > 0 and os.path.exists(final_result_file):
+        # 结果去重（实时写入可能含重复行）
+        with open(final_result_file, 'r', encoding='utf-8') as f:
             raw_results = f.readlines()
         deduped = deduplicate_results(raw_results)
         hit_count = len(deduped)
-
-        final_result_file = os.path.join(RESULT_DIR, f"{display_name}-{time_str}.txt")
         with open(final_result_file, 'w', encoding='utf-8') as f:
             f.writelines(deduped)
         ui_ok(f"结果已保存: {final_result_file}（去重后 {hit_count} 条）")
@@ -1488,7 +1531,8 @@ def run_pipeline(mode):
             csv_file = os.path.join(RESULT_DIR, f"{display_name}-{time_str}.csv")
             export_results_to_csv(deduped, csv_file)
     else:
-        ui_warn("引擎未生成结果文件")
+        final_result_file = None
+        ui_warn("未产生审查命中")
 
     elapsed = int(time.time() - t_start)
     rows = [("模式", f"{mode} · {display_name}"), ("用时", f"{elapsed // 60} 分 {elapsed % 60} 秒")]
@@ -1504,6 +1548,161 @@ def run_pipeline(mode):
     ui_summary(rows, "本模式汇总")
 
     return final_result_file
+
+
+def execute_one_mode(mode_id, targets, result_path, time_str, usernames, passwords):
+    """单个模式的审查任务（Popen 边跑边 tail 引擎输出，命中即时打印 + 实时写 results/）
+
+    供单模式（run_pipeline）与聚合模式（run_pipeline_all）共用，保证两条路径的
+    实时可见行为一致。返回 (mode_id, hit_count)。
+    """
+    import threading
+    mdir = os.path.join(WORK_DIR, f"mode_{mode_id}_{threading.get_ident()}")
+    os.makedirs(mdir, exist_ok=True)
+    input_file = os.path.join(mdir, "targets.txt")
+    with open(input_file, 'w', encoding='utf-8') as f:
+        for ip, port in targets:
+            f.write(f"{ip}:{port}\n")
+
+    config = load_mode_config(mode_id)
+    # 每模式独立：user/pass/config/input/output 都在 mdir
+    shutil.copy(input_file, os.path.join(mdir, "results.txt"))
+    with open(os.path.join(mdir, "user.txt"), 'w', encoding='utf-8') as f:
+        f.write('\n'.join(usernames))
+    with open(os.path.join(mdir, "pass.txt"), 'w', encoding='utf-8') as f:
+        f.write('\n'.join(passwords))
+    config["active_ports"] = []
+    config["engine_workers"] = SETTINGS.get("engine_workers", 50)
+    config["http_timeout"] = SETTINGS.get("http_timeout", 2)
+    conf_path = os.path.join(mdir, "engine_config.json")
+    with open(conf_path, 'w', encoding='utf-8') as f:
+        _json.dump(config, f, ensure_ascii=False, indent=2)
+
+    # 在 mdir 中运行引擎（输出 <mode>.txt 落在 mdir）
+    engine_bin = build_engine()
+    output_name = os.path.join(mdir, MODE_NAMES.get(mode_id, "output") + ".txt")
+
+    hit_count = 0
+    seen_lines = set()
+
+    # 实时写入目标结果文件（追加，边跑边落盘）
+    result_f = open(result_path, 'a', encoding='utf-8')
+    proc = None
+
+    def _emit_line(ln):
+        """命中行：终端即时显示 + 实时追加 results/（去重）"""
+        nonlocal hit_count
+        ln = ln.strip()
+        if not ln or ln in seen_lines:
+            return
+        seen_lines.add(ln)
+        hit_count += 1
+        ui_phase_log(mode_id, _c(f"命中 {ln}", "green"))
+        result_f.write(ln + "\n")
+        result_f.flush()
+
+    try:
+        proc = subprocess.Popen(
+            [engine_bin, os.path.abspath(conf_path),
+             os.path.abspath(os.path.join(mdir, "results.txt"))],
+            cwd=mdir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+
+        def _read_progress():
+            """读引擎 stdout 的进度行，转成统一进度显示"""
+            try:
+                for raw in proc.stdout:
+                    try:
+                        line = raw.decode('utf-8', errors='ignore').strip()
+                    except Exception:
+                        continue
+                    if not line:
+                        continue
+                    if "处理进度" in line:
+                        m = re.search(r'(\d+)/(\d+)', line)
+                        if m:
+                            cd, td = int(m.group(1)), int(m.group(2))
+                            ui_progress(cd, td, prefix=f"模式{mode_id} 审查")
+                    elif "异常" in line or "警告" in line:
+                        ui_phase_log(mode_id, _c(line, "yellow"))
+            except Exception:
+                pass
+
+        reader = threading.Thread(target=_read_progress, daemon=True)
+        reader.start()
+
+        # 轮询引擎输出文件的新增行 → 终端即时显示 + 实时追加 results/
+        # 以二进制读取：只处理「完整行」(\n 结尾)，未结束的尾部片段留到下一轮，
+        # 避免把半个 UTF-8 字符/半行当成命中写入
+        pos = 0
+        leftover = b""
+
+        def _drain(final=False):
+            nonlocal pos, leftover
+            if not os.path.exists(output_name):
+                return
+            with open(output_name, 'rb') as of:
+                of.seek(pos)
+                data = of.read()
+            if not data:
+                return
+            buf = leftover + data
+            parts = buf.split(b"\n")
+            # 最后一段如果后面没有 \n，则可能是未写完的行
+            tail = parts[-1]
+            if tail == b"":
+                # 以 \n 结尾，全部是完整行
+                complete = parts[:-1]
+                leftover = b""
+                consumed = len(buf)
+            elif final:
+                # 收尾阶段：即使没有 \n 也当作完整行
+                complete = parts
+                leftover = b""
+                consumed = len(buf)
+            else:
+                complete = parts[:-1]
+                leftover = tail
+                consumed = len(buf) - len(tail)
+            for ln in complete:
+                _emit_line(ln.decode('utf-8', errors='ignore'))
+            pos += consumed
+
+        while proc.poll() is None:
+            try:
+                _drain()
+            except OSError:
+                pass
+            time.sleep(0.8)
+
+        # 收尾：读取剩余行
+        proc.wait()
+        try:
+            _drain(final=True)
+        except OSError:
+            pass
+        result_f.flush()
+        os.fsync(result_f.fileno())
+    finally:
+        result_f.close()
+        if proc is not None:
+            if proc.stdout is not None:
+                try:
+                    proc.stdout.close()
+                except Exception:
+                    pass
+            if proc.poll() is None:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+    if hit_count == 0:
+        # 无命中：删除空的 results 文件，避免产生空文件
+        try:
+            os.remove(result_path)
+        except OSError:
+            pass
+    return (mode_id, hit_count)
 
 
 def run_pipeline_all(exclude_modes=(), exclude_ports=()):
@@ -1638,10 +1837,14 @@ def run_pipeline_all(exclude_modes=(), exclude_ports=()):
 
     def _check_one_ip(ip, ports):
         """单 IP 的多端口探测；E1: 同一服务命中后，跳过该 IP 该服务的其它端口
-        返回 (hits, done_pairs): hits=[(mode_id, ip, port)]，done_pairs=[(ip, port)] 为本次成功探测的组合
+        返回 (hits, checked, retry):
+          hits    = [(mode_id, ip, port)]  指纹命中
+          checked = [(ip, port)]           成功得出结论（命中或确认不匹配）的组合
+          retry   = [(ip, port)]           探测失败(超时/连接错误)需重试的组合
         """
         hits = []              # [(mode_id, ip, port)]
-        checked = []           # [(ip, port)] 本次真正探测过的组合
+        checked = []           # [(ip, port)] 本次成功探测过的组合
+        retry = []             # [(ip, port)] 探测失败需重试的组合
         claimed_modes = set()  # E1: 该 IP 已命中的服务
         for port in ports:
             cand_modes = port_mode_cache.get(port, [])
@@ -1649,6 +1852,7 @@ def run_pipeline_all(exclude_modes=(), exclude_ports=()):
             # 无候选服务（未知端口）时也应跑通用 Web 指纹兜底；
             # 仅当「有候选但全部因 E1 已命中而跳过」时才不兜底
             skipped_by_e1 = bool(cand_modes)
+            port_failed = False     # 该端口所有候选 probe 是否发生「可重试失败」
             for mode_id in cand_modes:
                 if mode_id in claimed_modes:
                     continue  # E1 短路
@@ -1658,14 +1862,16 @@ def run_pipeline_all(exclude_modes=(), exclude_ports=()):
                     continue
                 # 直接同步调用，避免为单条目标反复创建线程池
                 try:
-                    ok = bool(fingerprint_scan(f"{ip}:{port}", config))
+                    res = fingerprint_scan(f"{ip}:{port}", config)
                 except Exception:
-                    ok = False
-                if ok:
+                    res = None
+                if res is True:
                     hits.append((mode_id, ip, port))
                     claimed_modes.add(mode_id)
                     known_hit = True
                     break
+                if res is None:
+                    port_failed = True
             # 仅在「无候选服务」或「真探测未命中」时跑通用 Web 指纹；
             # 若候选服务均已被本 IP 的其它端口命中（E1 跳过），则不再兜底
             if not known_hit and not skipped_by_e1 and web_keywords:
@@ -1673,8 +1879,12 @@ def run_pipeline_all(exclude_modes=(), exclude_ports=()):
                 if mid is not None and mid not in exclude_modes and mid not in claimed_modes:
                     hits.append((mid, ip, port))
                     claimed_modes.add(mid)
-            checked.append((ip, port))
-        return hits, checked
+                    port_failed = False
+            if port_failed and not known_hit:
+                retry.append((ip, port))
+            else:
+                checked.append((ip, port))
+        return hits, checked, retry
 
     # --- C: 断点续扫 —— 载入已完成的 (ip,port) 与已命中结果 ---
     # 注意：以 (ip, port) 为粒度记录，避免端口清单变化后续跑误跳过未探测端口
@@ -1734,7 +1944,9 @@ def run_pipeline_all(exclude_modes=(), exclude_ports=()):
     hits_f = None
     done_f = None
 
-    def _flush_batch(batch_hits, batch_done):
+    retry_f = None
+
+    def _flush_batch(batch_hits, batch_done, batch_retry):
         for mode_id, ip, port in batch_hits:
             pair = (mode_id, ip, port)
             if pair in seen_pairs:
@@ -1744,42 +1956,79 @@ def run_pipeline_all(exclude_modes=(), exclude_ports=()):
             matched_modes.setdefault(mode_id, []).append((ip, port))
         for ip, port in batch_done:
             done_f.write(f"{ip}\t{port}\n")
+        for ip, port in batch_retry:
+            retry_f.write(f"{ip}\t{port}\n")
         hits_f.flush()
         done_f.flush()
+        retry_f.flush()
         os.fsync(hits_f.fileno())
         os.fsync(done_f.fileno())
 
-    # --- B: 分批提交，避免一次性创建海量 future 导致内存暴涨/被 OOM kill ---
-    total_pending = len(pending)
-    done = 0
-    batch_size = 2000
-    max_workers = min(32, total_pending) if total_pending else 1
-    try:
-        hits_f = open(FINGERPRINT_HITS, 'a', encoding='utf-8')
-        done_f = open(FINGERPRINT_DONE, 'a', encoding='utf-8')
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            for start in range(0, total_pending, batch_size):
-                batch = pending[start:start + batch_size]
+    def _run_batches(work_items, total_label, pbar_done_start=0, prefix="指纹验证"):
+        """分批并发探测一组 (ip, ports)；返回 (all_hits, all_done, all_retry, done_count)"""
+        all_hits, all_done, all_retry = [], [], []
+        n = len(work_items)
+        cnt = pbar_done_start
+        if n == 0:
+            return all_hits, all_done, all_retry, cnt
+        workers = min(SETTINGS.get("fingerprint_workers", 32), n) if n else 1
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            for start in range(0, n, batch_size):
+                batch = work_items[start:start + batch_size]
                 futures = {executor.submit(_check_one_ip, ip, ports): ip
                            for ip, ports in batch}
-                batch_hits = []
-                batch_done = []
+                batch_hits, batch_done, batch_retry = [], [], []
                 for future in as_completed(futures):
-                    done += 1
-                    ui_progress(done, total_pending, prefix="指纹验证")
+                    cnt += 1
+                    ui_progress(cnt, total_label, prefix=prefix)
                     try:
-                        hits, checked = future.result()
+                        hits, checked, retry = future.result()
                     except Exception:
-                        # 探测异常：不标记为已完成，续跑时会重试该 IP
+                        # 探测异常：不标记为已完成，续跑时会重试
                         continue
                     batch_hits.extend(hits)
                     batch_done.extend(checked)
-                _flush_batch(batch_hits, batch_done)
+                    batch_retry.extend(retry)
+                _flush_batch(batch_hits, batch_done, batch_retry)
+                all_hits.extend(batch_hits)
+                all_done.extend(batch_done)
+                all_retry.extend(batch_retry)
+        return all_hits, all_done, all_retry, cnt
+
+    # --- B: 分批提交，避免一次性创建海量 future 导致内存暴涨/被 OOM kill ---
+    total_pending = len(pending)
+    batch_size = SETTINGS.get("fingerprint_batch_size", 2000)
+    try:
+        hits_f = open(FINGERPRINT_HITS, 'a', encoding='utf-8')
+        done_f = open(FINGERPRINT_DONE, 'a', encoding='utf-8')
+        retry_f = open(FINGERPRINT_RETRY, 'w', encoding='utf-8')
+
+        _, _, retry_pairs, done_count = _run_batches(pending, total_pending)
+
+        # --- 失败重试轮：对超时/连接失败的 (ip,port) 用更长超时再试一次 ---
+        if retry_pairs:
+            retry_ports = {}
+            for ip, port in retry_pairs:
+                retry_ports.setdefault(ip, [])
+                if port not in retry_ports[ip]:
+                    retry_ports[ip].append(port)
+            retry_items = list(retry_ports.items())
+            ui_info(f"首轮有 {len(retry_pairs)} 个(IP,端口)探测失败，使用更长超时重试...")
+            old_timeout = SETTINGS.get("fingerprint_timeout", 1.5)
+            SETTINGS["fingerprint_timeout"] = SETTINGS.get("fingerprint_retry_timeout", 3.0)
+            try:
+                # 重试结果不再进入第二轮（避免无限重试）；
+                # 重试轮独立计数，进度按「重试项数」显示，避免与首轮基数叠加导致百分比 > 100%
+                _run_batches(retry_items, len(retry_items), prefix="指纹验证重试")
+            finally:
+                SETTINGS["fingerprint_timeout"] = old_timeout
     finally:
         if hits_f is not None:
             hits_f.close()
         if done_f is not None:
             done_f.close()
+        if retry_f is not None:
+            retry_f.close()
 
     for mode_id, targets in matched_modes.items():
         ui_info(f"模式{mode_id} {MODE_DISPLAY_NAMES.get(mode_id)} 匹配 {len(targets)} 个")
@@ -1789,7 +2038,7 @@ def run_pipeline_all(exclude_modes=(), exclude_ports=()):
         return None
 
     ui_stage("并行审查")
-    ui_ok(f"匹配到 {len(matched_modes)} 个服务类型，开始并行审查（最多 4 并发）")
+    ui_ok(f"匹配到 {len(matched_modes)} 个服务类型，开始并行审查（最多 {SETTINGS.get('mode_workers', 4)} 并发）")
     for mode_id, targets in matched_modes.items():
         ui_phase_log(mode_id, f"{len(targets)} 个目标")
 
@@ -1797,67 +2046,36 @@ def run_pipeline_all(exclude_modes=(), exclude_ports=()):
     mode_timings = {}
     t_scan = time.time()
 
-    def _run_mode_bruteforce(mode_id, targets):
-        """单个模式的审查任务（中间文件全部在 WORK_DIR，每模式独立子目录避免并发冲突）"""
-        import threading
-        config = load_mode_config(mode_id)
-        mdir = os.path.join(WORK_DIR, f"mode_{mode_id}_{threading.get_ident()}")
-        os.makedirs(mdir, exist_ok=True)
-        input_file = os.path.join(mdir, "targets.txt")
-        with open(input_file, 'w', encoding='utf-8') as f:
-            for ip, port in targets:
-                f.write(f"{ip}:{port}\n")
+    # 实时可见（Popen 边跑边 tail）+ 实时落盘由 execute_one_mode 统一实现
 
-        # 每模式独立：user/pass/config/input/output 都在 mdir
-        shutil.copy(input_file, os.path.join(mdir, "results.txt"))
-        with open(os.path.join(mdir, "user.txt"), 'w', encoding='utf-8') as f:
-            f.write('\n'.join(usernames))
-        with open(os.path.join(mdir, "pass.txt"), 'w', encoding='utf-8') as f:
-            f.write('\n'.join(passwords))
-        config["active_ports"] = []
-        conf_path = os.path.join(mdir, "engine_config.json")
-        with open(conf_path, 'w', encoding='utf-8') as f:
-            _json.dump(config, f, ensure_ascii=False, indent=2)
-
-        # 在 mdir 中运行引擎（输出 <mode>.txt 落在 mdir），使用预编译二进制避免并发竞争
-        engine_bin = build_engine()
-        subprocess.run([engine_bin, os.path.abspath(conf_path),
-                        os.path.abspath(os.path.join(mdir, "results.txt"))],
-                       check=True, cwd=mdir,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-        output_name = os.path.join(mdir, MODE_NAMES.get(mode_id, "output") + ".txt")
-        if os.path.exists(output_name):
-            with open(output_name, 'r', encoding='utf-8') as f:
-                results = f.readlines()
-            deduped = deduplicate_results(results)
-            return (mode_id, deduped, len(deduped))
-        return None
-
-    # 并行执行各模式审查 (最多 4 个并行)
-    # 结果文件在「该模式完成的瞬间」就写入 results/，中途被杀也能保住已完成的服务
+    # 并行执行各模式审查（结果文件在「该模式运行期间」就实时写入 results/）
     beijing_time = datetime.now(timezone.utc) + timedelta(hours=8)
     time_str = beijing_time.strftime("%Y%m%d-%H%M%S")
-    max_workers = min(4, len(matched_modes))
+    max_workers = min(SETTINGS.get("mode_workers", 4), len(matched_modes))
+
+    # 预分配每个模式的结果文件路径，保证实时显示时文件名已知
+    mode_result_paths = {}
+    for mode_id in matched_modes:
+        display_name = MODE_DISPLAY_NAMES.get(mode_id, "output")
+        mode_result_paths[mode_id] = os.path.join(RESULT_DIR, f"{display_name}-{time_str}.txt")
+
     final_result_files = []
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {}
         for mode_id, targets in matched_modes.items():
-            future = executor.submit(_run_mode_bruteforce, mode_id, targets)
+            future = executor.submit(execute_one_mode, mode_id, targets,
+                                     mode_result_paths[mode_id], time_str,
+                                     usernames, passwords)
             futures[future] = mode_id
 
         for future in as_completed(futures):
             mode_id = futures[future]
             try:
                 result = future.result()
-                if result:
-                    all_results.append(result)
-                    display_name = MODE_DISPLAY_NAMES.get(mode_id, "output")
-                    final_name = os.path.join(RESULT_DIR, f"{display_name}-{time_str}.txt")
-                    with open(final_name, 'w', encoding='utf-8') as f:
-                        f.writelines(result[1])
-                    final_result_files.append(final_name)
-                    ui_phase_log(mode_id, _c(f"完成 · {result[2]} 条命中 → {final_name}", "green"))
+                if result and result[1] > 0:
+                    all_results.append((mode_id, result[1]))
+                    final_result_files.append(mode_result_paths[mode_id])
+                    ui_phase_log(mode_id, _c(f"完成 · {result[1]} 条命中 → {mode_result_paths[mode_id]}", "green"))
                 else:
                     ui_phase_log(mode_id, "完成 · 0 条命中")
             except Exception as e:
@@ -1867,7 +2085,7 @@ def run_pipeline_all(exclude_modes=(), exclude_ports=()):
     scan_elapsed = int(time.time() - t_scan)
 
     total_elapsed = int(time.time() - t_start)
-    total_hits = sum(r[2] for r in all_results)
+    total_hits = sum(r[1] for r in all_results)
     rows = [
         ("扫描端口组", len(port_groups)),
         ("匹配服务", len(matched_modes)),
@@ -1877,7 +2095,7 @@ def run_pipeline_all(exclude_modes=(), exclude_ports=()):
         ("总用时", f"{total_elapsed // 60} 分 {total_elapsed % 60} 秒"),
     ]
     for mode_id, targets in matched_modes.items():
-        hit = next((r[2] for r in all_results if r[0] == mode_id), 0)
+        hit = next((r[1] for r in all_results if r[0] == mode_id), 0)
         rows.append((f"  模式{mode_id} {MODE_DISPLAY_NAMES.get(mode_id)}", f"{len(targets)} 目标 / {hit} 命中"))
     ui_summary(rows, "全服务扫描汇总")
 

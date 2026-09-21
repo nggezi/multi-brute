@@ -1,137 +1,130 @@
-# multi-brute
+# multi-brute · 内部授权安全审计工具
 
-多服务面板 / 服务的**授权安全审查**工具。统一引擎（Go）+ 调度层（Python）架构，
-每个模式都自动执行完整流水线：
+面向**自有/内部授权资产**的批量服务指纹识别与弱口令审计工具。  
+对外部未授权目标使用属于违法行为，本项目仅供授权范围内使用。
+
+核心流程由 Python 调度层（`src/xui.py`）+ 统一 Go 引擎（`src/engine.go`）组成：
 
 ```
-masscan 端口扫描 → 指纹验证 → 统一引擎审查 → 结果导出
+目标列表 ──► masscan 端口扫描 ──► 指纹验证 ──► 统一引擎精准审计 ──► results/
 ```
 
-> 仅限**自有资产**或**获得书面授权**的目标使用。使用者需自行确保合规。
+## 功能特性
 
-## 特性
-
-- **15 种服务模式 + 2 种聚合模式**：每种服务内置默认端口与指纹规则，自动筛选真实目标，避免无效请求。
-- **统一 Go 引擎**：所有模式共用一个编译后的引擎二进制，并发受控、写入加锁、支持断点续扫。
-- **指纹前置**：masscan 发现开放端口后，先用 HTTP/TCP 指纹确认真实服务，再进入审查阶段。
+- **16 种审计模式**：X-UI、哪吒、H-UI、咸蛋、S-UI、SSH、Sub Store、OpenWrt/iStoreOS、AI Key 池、Alist、MiSub 登录/指纹、代理海选、全服务扫描、通用 Web 指纹。
+- **统一引擎**：所有模式共用同一个 Go 引擎，按模式配置自动路由到 HTTP / SSH / TCP 审计逻辑，不再维护 13 份模板。
+- **三阶段流水线**：masscan 端口扫描 → 指纹验证 → 精准审计，全程自动执行。
+- **三态指纹探测**：`True` 匹配 / `False` 响应但不匹配 / `None` 超时失败，失败目标自动进入重试轮。
 - **韧性设计**：
-  - 指纹结果**分批落盘**（每 2000 个目标 fsync 一次），中途被杀不丢已扫结果；
-  - 审查阶段**每个服务完成即写** `results/`，不必等全部跑完；
-  - 支持**断点续扫**（以 `(IP, 端口)` 为粒度），重启后可选择继续或全新扫描；
-  - 中断（Ctrl+C / 异常）时自动把已完成的服务输出抢救到 `results/`。
-- **字典来源**：本地字典 / Kali 系统字典 (`/usr/share/wordlists`) / 内置默认凭证。
-- **多格式导出**：TXT / JSON / CSV。
+  - 指纹命中/已探测记录**增量落盘**（`work/fingerprint_hits.txt` / `work/fingerprint_done.txt`），支持断点续扫。
+  - 审查结果**实时写入** `results/`，中断时抢救已产出结果。
+  - 中断后可选择续扫（per-`(ip, port)` 粒度去重）。
+- **实时可见**：审计阶段实时打印命中行 + 进度计数，结果同步落盘。
+- **可调参数**：`config/settings.json` 集中管理超时、并发、速率等。
 
 ## 目录结构
 
 ```
-.
-├── main.py                # 入口：切到项目根目录后执行 src/xui.py
-├── yj.sh                  # 快捷脚本（可选，先跑 bgp.py 再跑 main.py）
-├── guide.md
-├── config/                # 每个模式一份配置（端口 + 指纹规则）
-│   ├── mode_01_xui.json
+scan/
+├── main.py                  # 入口：切到项目根目录后执行 src/xui.py
+├── yj.sh                    # 快捷脚本：bgp.py + main.py
+├── prefixes.txt             # 目标列表（CIDR / 范围 / 单IP / IP:端口，每行一个）
+├── username.txt             # 用户名字典
+├── password.txt             # 密码字典
+├── guide.md                 # 速查备注
+├── src/
+│   ├── xui.py               # Python 调度层（UI / masscan / 指纹 / 流水线 / 实时 tail）
+│   ├── engine.go            # 统一 Go 引擎（HTTP / SSH / TCP 审计）
+│   ├── bgp.py               # BGP 辅助脚本
+│   ├── go.mod
+│   └── go.sum
+├── config/
+│   ├── mode_01_xui.json     # 各模式端口 + 指纹规则
 │   ├── ...
 │   ├── mode_15_webfp.json
-│   └── web_keywords.json  # 未知端口通用 Web 指纹关键词表
-├── src/
-│   ├── xui.py             # 调度层：菜单、masscan、指纹、流水线、导出
-│   ├── engine.go          # 统一 Go 引擎
-│   ├── go.mod / go.sum
-│   └── bgp.py             # 按 ASN 拉取 IPv4 前缀（写入 prefixes.txt）
-├── results/               # 最终产物
-└── work/                  # 运行时中间目录（自动清理，不提交）
+│   ├── web_keywords.json    # 未知端口通用 Web 指纹关键词表
+│   └── settings.json        # 可调参数
+├── work/                    # 中间/临时文件（引擎输入输出、进度文件、日志）
+│   ├── outputs/
+│   └── logs/
+└── results/                 # 最终审计结果
 ```
 
-## 环境要求
+## 模式一览
 
-| 依赖 | 说明 |
-|------|------|
-| Python 3 | `requests`、`openpyxl` |
-| Go 1.21+ | 运行时会自动编译 `engine.go` |
-| masscan | 端口扫描，需手动安装：`sudo apt install masscan -y` |
+| 模式 | 名称 | 默认端口 |
+|------|------|----------|
+| 1 | X-UI 面板审查 | 2053, 54321 |
+| 2 | 哪吒面板审查 | 8008 |
+| 3 | H-UI 面板审查 | 8081 |
+| 4 | 咸蛋面板审查 | 需输入 |
+| 5 | S-UI 面板审查 | 2095 |
+| 6 | SSH 审查 | 22 |
+| 7 | Sub Store 审查 | 3000, 3001 |
+| 8 | OpenWrt/iStoreOS | 80, 8443 |
+| 9 | AI Key 池审查 | 需输入 |
+| 10 | Alist 审查 | 5244 |
+| 11 | MiSub 登录审查 | 25556 |
+| 12 | MiSub 指纹海选 | 25556 |
+| 13 | Socks5/HTTP 代理 | 需指定 |
+| 14 | 全服务扫描 | 18 端口（含 SSH 22、80/443/8080/8443） |
+| 15 | 通用 Web 指纹海选 | 80, 443, 8080, 8443, 3000, 5000, 8000, 8888, 9000 |
+| 16 | 全服务扫描（不含 SSH，推荐） | 13 端口（去掉 22/80/443/8080/8443） |
 
-`check_environment()` 会在启动时检测缺失项并按需安装（Go / pip / requests / openpyxl）。
+> 带端口的输入行（如 `1.2.3.4:8000`）会跳过指纹验证，直接按该服务逻辑审查；CIDR / 单 IP 走 masscan + 指纹验证。模式 14/16 由代码合成，无独立配置文件。
 
-## 使用
+## 环境依赖
+
+- Python 3 + `requests`、`openpyxl`
+- Go 1.22+（引擎会在首次运行时自动 `go build`）
+- masscan
+- Linux（VPS / Kali）；Go 编译验证必须在目标机进行
+
+## 使用方法
 
 ```bash
-git clone https://github.com/nggezi/multi-brute.git
-cd multi-brute
+# 快捷方式（根目录）
+./yj.sh
+
+# 或直接运行
 python3 main.py
 ```
 
-按提示选择模式与目标输入方式。**所有模式默认走聚合流程。**
+交互流程（以模式 16 为例）：
 
-### 目标输入格式
+1. 选择模式（1-16，默认 16）
+2. 选择输入方式（1 = 手动输入 IP 范围，2 = 从文件读取，默认 2）
+3. 输入文件路径（默认 `prefixes.txt`）
+4. 选择字典来源（1 = 本地文件，2 = Kali 系统字典，3 = 默认凭证）
 
-`prefixes.txt`（每行一个，支持混合格式，`#` 开头为注释）：
+非交互（脚本化）示例：
 
+```bash
+printf '16\n2\n\n2\n' | python3 main.py
 ```
-192.168.1.1:443        # IP:端口（直通，不做 masscan）
-10.0.0.1               # 单 IP
-10.0.0.0/24            # CIDR（masscan 扫描默认端口）
-10.0.0.1-10.0.0.50     # 范围
-172.16.0.1 8080        # IP + 空格 + 端口
-```
 
-也可在运行时直接输入 IP 段，无需文件。
+> 若 `work/` 下已有指纹进度文件，启动时会额外提示「是否续扫？(Y/n)」，需在 stdin 中额外补一行。
 
-### 模式列表
+## 可调参数（config/settings.json）
 
-| 模式 | 服务 | 默认端口 | 指纹 |
-|------|------|----------|------|
-| 1 | X-UI | 2053, 54321 | GET `/login` → 含 `x-ui` |
-| 2 | 哪吒 (Nezha) | 8008 | POST `/api/v1/login` → `success==true` |
-| 3 | H-UI | 8081 | POST `/hui/auth/login` → 含 `accessToken` |
-| 4 | 咸蛋 (xdpanel) | 需输入 | POST `/login` → `data.token` |
-| 5 | S-UI | 2095 | POST `/app/api/login` → `success==true` |
-| 6 | SSH | 22 | TCP banner `SSH-` |
-| 7 | Sub Store | 3000, 3001 | GET `/{path}/api/utils/env` 或 `/` |
-| 8 | OpenWrt / iStoreOS | 80, 8443 | POST `/cgi-bin/luci/` → title |
-| 9 | AI Key 池 | 需输入 | POST `/api/auth/login` → `success==true` |
-| 10 | Alist | 5244 | GET `/api/me` → `code==200` |
-| 11 | MiSub 登录 | 25556 | POST `/api/login` → `success==true` |
-| 12 | MiSub 指纹 | 25556 | GET `/` → title `MiSub` |
-| 13 | Socks5 / HTTP 代理 | 需指定 | TCP 连接 + 协议识别 |
-| 14 | **全服务扫描** | 全部（含 SSH） | 逐端口匹配全部服务指纹 |
-| 15 | 通用 Web 指纹海选 | 80, 443, 8080, 8443, 3000, 5000, 8000, 8888, 9000 | title 关键词 |
-| 16 | **全服务扫描（不含 SSH）** | 全部（去掉 22/80/443/8080/8443） | 同上（推荐） |
-
-### 字典来源
-
-1. **本地文件** — `username.txt` / `password.txt`（模式 7、9 固定用户名，只读 `password.txt`）
-2. **Kali 系统字典** — `/usr/share/wordlists`
-3. **默认凭证** — 内置各服务的常见弱口令组合
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `fingerprint_timeout` | 1.5 | 指纹探测单次超时（秒） |
+| `fingerprint_retry_timeout` | 3.0 | 重试轮的超时（秒） |
+| `fingerprint_workers` | 32 | 指纹并发 |
+| `fingerprint_batch_size` | 2000 | 指纹分批提交大小 |
+| `engine_workers` | 50 | 引擎并发（Go 端） |
+| `mode_workers` | 4 | 审查阶段同时跑几种服务 |
+| `masscan_rate` | 10000 | masscan 发包速率 |
+| `masscan_wait` | 3 | masscan `--wait` |
+| `masscan_timeout` | 600 | masscan 进程超时（秒） |
+| `http_timeout` | 2 | 引擎 HTTP 请求超时（秒） |
 
 ## 输出
 
-最终结果写入 `results/{服务名}-{YYYYMMDD-HHMMSS}.txt`，可选 JSON / CSV。
-
-中断时已完成但未汇总的输出会抢救为 `results/{服务名}-rescue-{时间戳}-p{pid}.txt`。
-
-运行时中间文件全部在 `work/`，正常结束会自动清空。
-
-## 断点续扫
-
-指纹阶段以 `(IP, 端口)` 为粒度记录进度。若上次运行被中断，进度会保留；
-下次启动时会询问：
-
-```
-发现上次未完成的指纹进度，是否续扫？(Y/n)：
-```
-
-- 回车 / `Y` → 只处理剩余目标
-- `n` → 清空旧进度，全新扫描
-
-## 开发
-
-```bash
-python -m py_compile src/xui.py     # 语法检查
-go vet ./src/...                    # 引擎检查（可选）
-```
+- 最终结果位于 `results/`，每个模式一份 `<模式名>-<时间戳>.txt`。
+- 中间文件与进度位于 `work/`（`fingerprint_hits.txt` / `fingerprint_done.txt` / `fingerprint_retry.txt` 等）。
 
 ## 免责声明
 
-本项目仅供安全研究与**授权范围内**的资产审查使用。请勿用于未授权目标。
-因使用本工具产生的一切后果由使用者自行承担。
+本项目仅限**公司内部或已获书面授权的资产**安全审计使用。使用者须确保目标在授权范围内，任何未授权的使用行为由使用者自行承担全部法律责任。
